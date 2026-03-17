@@ -54,7 +54,8 @@ https://www.modorganizer.org/
 <img width="1916" height="1008" alt="image" src="https://github.com/user-attachments/assets/70e471f4-84d4-4428-ad11-b19a4aea18e2" />
 <img width="764" height="619" alt="image" src="https://github.com/user-attachments/assets/386be464-e4c8-4aac-80d5-294e8f2d7660" />
 <img width="769" height="611" alt="image" src="https://github.com/user-attachments/assets/0062b56a-a540-4990-b09f-34ec95d9a7e0" />
-<img width="1464" height="774" alt="image" src="https://github.com/user-attachments/assets/15f3c30b-14a5-481e-b92e-1508497c0232" />
+<img width="760" height="732" alt="image" src="https://github.com/user-attachments/assets/e47df746-497d-4b8b-b575-b147f1c17bf5" />
+
 
 
 
