@@ -11,7 +11,7 @@ Enables full modding support for both games in Mod Organizer 2.
   - Multiple loose-file install options  
   - Simple loose-file installs
 - Modding support for all required game folders (the Data folder and non-game asset directories are excluded)
-- **HK Reassembler** – a TSLPatcher mod manager
+- **Patcher Tab** – a TSLPatcher mod manager
 - **Save Files tab** with thumbnails
 - **Texture Conflicts tab**
 - Steam Workshop subscription detection (warns you to unsubscribe)
@@ -31,9 +31,9 @@ When downloading mods, place them in the **Downloads** folder under your MO2 dir
 - Mods containing multiple TSLPatchers will prompt you to choose which ones to add.  
   If you need to install multiple components from a single archive, double-click the archive again and install the next part under a different name.
 - TSLPatcher mods **are not managed by MO2**, so enabling them in the mod list is not required.  
-  Their **order still matters**, and HK Reassembler respects that order.
-- To manage TSLPatcher mods, launch **HK Reassembler** from the dropdown next to the **Run** button (top right).  
-  Check the TSLPatcher parts you want to install and click *Save*. They will be applied in **modlist order**.  
+  Their **order still matters**, and Patcher Tab respects that order.
+- To manage TSLPatcher mods, select the **Patcher Tab** 
+  Check the TSLPatcher parts you want to install and click *Run*. They will be applied in **modlist order**.  
   This creates a new mod called **HK_REASSEMBLER**. Enable it and move it wherever you want in your load order.
 
 ### Texture Conflicts Tab
@@ -49,7 +49,7 @@ This matters because the game accepts several texture formats (**TPC, TGA, DDS, 
 https://www.modorganizer.org/
 
 ## Holo Patcher
-[Holo Patcher](https://github.com/th3w1zard1/HoloPatcher) is used to install TSLPatcher mods in the HK Reassembler mod manager.
+[Holo Patcher](https://github.com/th3w1zard1/HoloPatcher) is used to install TSLPatcher mods in the Patcher Tab mod manager.
 
 <img width="1916" height="1008" alt="image" src="https://github.com/user-attachments/assets/70e471f4-84d4-4428-ad11-b19a4aea18e2" />
 <img width="764" height="619" alt="image" src="https://github.com/user-attachments/assets/386be464-e4c8-4aac-80d5-294e8f2d7660" />
