@@ -363,33 +363,56 @@ class Kotor2TextureTab(QWidget):
         finally:
             self.refresh()
 
+    # Build the currently winning visible texture files by normalized base.
+    def _visible_winner_files_by_base(self) -> dict[str, dict[str, Path]]:
+        winners: dict[str, Path] = {}
+
+        for _source, root in self._iter_override_roots():
+            for file in root.rglob("*"):
+                if not file.is_file() or file.name.endswith(".mohidden"):
+                    continue
+                if file.suffix.lower() not in self._EXTENSIONS:
+                    continue
+                rel = file.relative_to(root).as_posix()
+                key = rel.lower()
+                if key not in winners:
+                    winners[key] = file
+
+        visible_by_base: dict[str, dict[str, Path]] = {}
+        for rel, path in winners.items():
+            base = Path(rel).with_suffix("").as_posix().lower()
+            visible_by_base.setdefault(base, {})[path.suffix.lower()] = path
+
+        return visible_by_base
+
     # Hide lower-priority visible texture variants for each texture base.
     def _auto_fix(self):
-        visible_by_base: dict[str, dict[str, Path]] = {}
-        for i in range(self._tree.topLevelItemCount()):
-            item = self._tree.topLevelItem(i)
-            if bool(item.data(0, Qt.ItemDataRole.UserRole + 1)):
-                continue
-            path = self._item_path(item)
-            base = item.data(0, Qt.ItemDataRole.UserRole + 4)
-            if not path or not base:
-                continue
-            visible_by_base.setdefault(str(base), {})[path.suffix.lower()] = path
+        while True:
+            visible_by_base = self._visible_winner_files_by_base()
+            to_hide: list[Path] = []
 
-        to_hide: list[Path] = []
-        for files in visible_by_base.values():
-            winner_exts = self._winner_extensions(files)
-            if not winner_exts:
-                continue
-            for ext, path in files.items():
-                if ext not in winner_exts:
-                    to_hide.append(path)
+            for files in visible_by_base.values():
+                winner_exts = self._winner_extensions(files)
+                if not winner_exts:
+                    continue
+                for ext, path in files.items():
+                    if ext not in winner_exts:
+                        to_hide.append(path)
 
-        for path in to_hide:
-            try:
-                path.rename(path.with_name(path.name + ".mohidden"))
-            except Exception as e:
-                logger.warning(f"[KOTOR2] Failed to auto-hide {path}: {e}")
+            if not to_hide:
+                break
+
+            changed = False
+            for path in to_hide:
+                try:
+                    path.rename(path.with_name(path.name + ".mohidden"))
+                    changed = True
+                except Exception as e:
+                    logger.warning(f"[KOTOR2] Failed to auto-hide {path}: {e}")
+
+            if not changed:
+                break
+
         self.refresh()
 
     # Unhide every hidden texture in the active mod stack.

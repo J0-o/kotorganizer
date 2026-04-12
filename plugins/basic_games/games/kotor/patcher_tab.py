@@ -47,6 +47,18 @@ logger = logging.getLogger("mobase")
 PATCHER_MOD_NAME = "[ PATCHER FILES ]"
 
 
+def _read_ini_with_fallbacks(parser: configparser.ConfigParser, ini_path: Path) -> None:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            parser.read(ini_path, encoding=encoding)
+            return
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+
+
 # Convert a subset of RTF into readable plain text.
 def _rtf_to_text(rtf: str) -> str:
     out: list[str] = []
@@ -620,7 +632,7 @@ class Kotor2HKReassemblerTab(QWidget):
                 parser = configparser.ConfigParser(interpolation=None)
                 parser.optionxform = str
                 try:
-                    parser.read(namespaces_ini, encoding="utf-8")
+                    _read_ini_with_fallbacks(parser, namespaces_ini)
                 except Exception as e:
                     logger.warning("[KOTOR2] Failed to read namespaces.ini for %s: %s", mod_path.name, e)
                     continue
@@ -640,13 +652,23 @@ class Kotor2HKReassemblerTab(QWidget):
                     data_path = parser.get(ns_name, "DataPath", fallback="").strip()
                     description = parser.get(ns_name, "Description", fallback="").strip()
                     final_path = patch_dir / data_path if data_path else patch_dir
-                    ini_path = final_path / ini_name if ini_name else final_path / "changes.ini"
-                    if not ini_path.exists():
-                        fallback = final_path / "changes.ini"
-                        if fallback.exists():
-                            ini_path = fallback
-                        else:
-                            continue
+                    ini_candidates: list[Path] = []
+                    if ini_name:
+                        ini_candidates.extend(
+                            [
+                                final_path / ini_name,
+                                patch_dir / ini_name,
+                            ]
+                        )
+                    ini_candidates.extend(
+                        [
+                            final_path / "changes.ini",
+                            patch_dir / "changes.ini",
+                        ]
+                    )
+                    ini_path = next((candidate for candidate in ini_candidates if candidate.exists()), None)
+                    if ini_path is None:
+                        continue
 
                     parsed = parse_tslpatcher_ini(ini_path)
                     entries.append(
@@ -656,7 +678,7 @@ class Kotor2HKReassemblerTab(QWidget):
                             mod_name=mod_path.name,
                             patch_name=ns_name,
                             description=description or parsed.description,
-                            ini_short_path=str((Path(data_path) / ini_name).as_posix() if data_path else ini_name or "changes.ini"),
+                            ini_short_path=str(ini_path.relative_to(patch_dir).as_posix()),
                             destination="; ".join(parsed.destinations),
                             install_paths="; ".join(parsed.install_paths),
                             files="; ".join(parsed.files),
@@ -1121,7 +1143,7 @@ class Kotor2HKReassemblerTab(QWidget):
         parser = configparser.ConfigParser(interpolation=None)
         parser.optionxform = str
         try:
-            parser.read(namespaces_ini, encoding="utf-8")
+            _read_ini_with_fallbacks(parser, namespaces_ini)
         except Exception:
             return ""
 
