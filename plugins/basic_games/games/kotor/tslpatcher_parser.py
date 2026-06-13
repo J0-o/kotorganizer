@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Represent one parsed TSLPatcher operation.
+
 @dataclass(frozen=True)
 class TslPatcherOperation:
     resource_type: str
@@ -13,7 +13,7 @@ class TslPatcherOperation:
     scope: tuple[str, ...]
     source_section: str
 
-    # Build stable conflict keys for one parsed operation.
+
     def conflict_keys(self) -> tuple[str, ...]:
         if self.resource_type == "file" and self.action != "replace":
             return tuple()
@@ -55,7 +55,7 @@ class TslPatcherOperation:
         return (base,)
 
 
-# Hold the parsed metadata extracted from one INI file.
+
 @dataclass(frozen=True)
 class ParsedIniData:
     description: str
@@ -87,7 +87,7 @@ _IGNORED_SCOPE_KEYS = {
 }
 
 
-# Strip trailing TSLPatcher comment markers from a line.
+
 def _strip_ini_comment(line: str) -> str:
     for marker in ("//", ";"):
         idx = line.find(marker)
@@ -96,18 +96,18 @@ def _strip_ini_comment(line: str) -> str:
     return line.strip()
 
 
-# Normalize a value for case-insensitive comparisons.
+
 def _normalize_entry(value: str) -> str:
     value = value.strip().strip('"').strip("'")
     return value.replace("/", "\\").lower()
 
 
-# Normalize a path or filename target.
+
 def _normalize_target(value: str) -> str:
     return _normalize_entry(value)
 
 
-# Detect values that refer to files rather than labels.
+
 def _looks_like_file(value: str) -> bool:
     if not value:
         return False
@@ -120,14 +120,14 @@ def _looks_like_file(value: str) -> bool:
     return "\\" in value or "/" in value or filename == "dialog.tlk"
 
 
-# Detect values that look like install destinations.
+
 def _looks_like_install_path(value: str) -> bool:
     if not value or value.isdigit():
         return False
     return not _looks_like_file(value)
 
 
-# Load the INI while dropping blank and commented lines.
+
 def _iter_clean_lines(ini_path: Path) -> list[str]:
     return [
         trimmed
@@ -136,7 +136,7 @@ def _iter_clean_lines(ini_path: Path) -> list[str]:
     ]
 
 
-# Parse the INI with case-preserving keys.
+
 def _parse_config(ini_path: Path) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     parser.optionxform = str
@@ -150,7 +150,7 @@ def _parse_config(ini_path: Path) -> configparser.ConfigParser:
     return parser
 
 
-# Find a section by name without caring about case.
+
 def _find_section(parser: configparser.ConfigParser, *names: str) -> str | None:
     lower_map = {section.lower(): section for section in parser.sections()}
     for name in names:
@@ -162,7 +162,7 @@ def _find_section(parser: configparser.ConfigParser, *names: str) -> str | None:
     return None
 
 
-# Extract the row selector used by a 2DA patch section.
+
 def _extract_row_selector(parser: configparser.ConfigParser, section_name: str) -> str | None:
     if not parser.has_section(section_name):
         return None
@@ -188,7 +188,7 @@ def _extract_row_selector(parser: configparser.ConfigParser, section_name: str) 
     return None
 
 
-# Extract the 2DA columns that a section edits.
+
 def _extract_2da_columns(parser: configparser.ConfigParser, section_name: str) -> tuple[str, ...]:
     if not parser.has_section(section_name):
         return tuple()
@@ -209,7 +209,7 @@ def _extract_2da_columns(parser: configparser.ConfigParser, section_name: str) -
     return tuple(dict.fromkeys(cols).keys())
 
 
-# Extract a stable row identity for a 2DA patch section.
+
 def _extract_2da_row_identity(
     parser: configparser.ConfigParser, section_name: str, action_key: str | None = None
 ) -> str | None:
@@ -246,7 +246,7 @@ def _extract_2da_row_identity(
     return None
 
 
-# Extract edited field paths from a GFF patch section.
+
 def _extract_gff_paths(parser: configparser.ConfigParser, section_name: str) -> tuple[str, ...]:
     if not parser.has_section(section_name):
         return tuple()
@@ -267,7 +267,7 @@ def _extract_gff_paths(parser: configparser.ConfigParser, section_name: str) -> 
     return tuple(dict.fromkeys(paths).keys())
 
 
-# Extract the identity scope for a TLK patch section.
+
 def _extract_tlk_scope(parser: configparser.ConfigParser, key: str, value: str) -> tuple[str, ...]:
     lower_key = key.lower().strip()
     stripped_value = value.strip()
@@ -295,7 +295,7 @@ def _extract_tlk_scope(parser: configparser.ConfigParser, key: str, value: str) 
     return (f"entry={_normalize_entry(section_name)}",)
 
 
-# Choose the file target referenced by a list entry.
+
 def _target_from_list_value(key: str, value: str, expected_suffixes: set[str] | None = None) -> str:
     key_norm = _normalize_target(key)
     value_norm = _normalize_target(value)
@@ -310,7 +310,7 @@ def _target_from_list_value(key: str, value: str, expected_suffixes: set[str] | 
     return value_norm or key_norm
 
 
-# Join an install location and file target into one key.
+
 def _join_location_target(location: str, target: str) -> str:
     location = _normalize_target(location)
     target = _normalize_target(target)
@@ -321,7 +321,7 @@ def _join_location_target(location: str, target: str) -> str:
     return f"{location}::{target}"
 
 
-# Parse install folder and destination directives from the INI.
+
 def _parse_install_folder_and_destination(parser: configparser.ConfigParser) -> tuple[tuple[str, ...], tuple[str, ...]]:
     install_paths: list[str] = []
     destinations: list[str] = []
@@ -338,7 +338,7 @@ def _parse_install_folder_and_destination(parser: configparser.ConfigParser) -> 
     return tuple(dict.fromkeys(install_paths).keys()), tuple(dict.fromkeys(destinations).keys())
 
 
-# Parse Required entries from the INI.
+
 def _parse_required(parser: configparser.ConfigParser) -> tuple[str, ...]:
     required: list[str] = []
     for section_name in parser.sections():
@@ -350,7 +350,7 @@ def _parse_required(parser: configparser.ConfigParser) -> tuple[str, ...]:
     return tuple(dict.fromkeys(required).keys())
 
 
-# Parse all supported patch operations from the INI.
+
 def _parse_operations(parser: configparser.ConfigParser) -> tuple[TslPatcherOperation, ...]:
     operations: list[TslPatcherOperation] = []
 
@@ -488,7 +488,7 @@ def _parse_operations(parser: configparser.ConfigParser) -> tuple[TslPatcherOper
     return tuple(operations)
 
 
-# Derive the file list from parsed operations.
+
 def _files_from_operations(operations: tuple[TslPatcherOperation, ...]) -> tuple[str, ...]:
     files: list[str] = []
     for operation in operations:
@@ -499,7 +499,7 @@ def _files_from_operations(operations: tuple[TslPatcherOperation, ...]) -> tuple
     return tuple(dict.fromkeys(files).keys())
 
 
-# Parse one TSLPatcher INI into the data used by the UI.
+
 def parse_tslpatcher_ini(ini_path: Path) -> ParsedIniData:
     if not ini_path.exists():
         return ParsedIniData("", tuple(), tuple(), tuple(), tuple(), tuple())

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-# Show plugin info and tool links.
+
 class KotorInfoTab(QWidget):
     _TOOLS = (
         (
@@ -30,7 +30,7 @@ class KotorInfoTab(QWidget):
         ),
     )
 
-    # Build the centered info tab.
+
     def __init__(self, parent: QWidget | None, organizer, game):
         super().__init__(parent)
         self._organizer = organizer
@@ -56,7 +56,7 @@ class KotorInfoTab(QWidget):
 
         layout.addStretch(1)
 
-    # Build the logo label.
+
     def _logo_widget(self) -> QLabel:
         label = QLabel("KOTORganizer")
         label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -80,7 +80,7 @@ class KotorInfoTab(QWidget):
         label.setFont(logo_font)
         return label
 
-    # Find the logo image file.
+
     def _logo_path(self) -> Path | None:
         candidates = (
             "logo.png",
@@ -101,14 +101,14 @@ class KotorInfoTab(QWidget):
                 return matches[0]
         return None
 
-    # Return the active game short name.
+
     def _game_short_name(self) -> str:
         try:
             return str(self._game.gameShortName())
         except Exception:
             return str(getattr(self._game, "GameShortName", "KOTOR"))
 
-    # Return the active plugin version.
+
     def _game_version(self) -> str:
         try:
             version = self._game.version()

@@ -9,7 +9,7 @@ from tslpatcher_parser import TslPatcherOperation, parse_tslpatcher_ini
 logger = logging.getLogger("mobase")
 
 
-# Hold one parsed patch entry shown in the patcher tab.
+
 @dataclass
 class PatchEntry:
     enabled: bool
@@ -25,7 +25,7 @@ class PatchEntry:
     operations: tuple[TslPatcherOperation, ...]
 
 
-# Read an INI with common encodings.
+
 def read_ini_with_fallbacks(parser: configparser.ConfigParser, ini_path: Path) -> None:
     last_error: Exception | None = None
     for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
@@ -38,7 +38,7 @@ def read_ini_with_fallbacks(parser: configparser.ConfigParser, ini_path: Path) -
         raise last_error
 
 
-# Find the TSLPatcher data folder.
+
 def find_patch_dir(mod_path: Path) -> Path | None:
     for name in ("tslpatchdata", "TSLPatcherData", "patchdata"):
         candidate = mod_path / name
@@ -47,7 +47,7 @@ def find_patch_dir(mod_path: Path) -> Path | None:
     return None
 
 
-# Collect all patch entries from mods.
+
 def collect_patch_entries(
     mods_root: Path,
     profile_order: list[str],
@@ -83,7 +83,7 @@ def collect_patch_entries(
     return entries
 
 
-# Collect namespaced patch entries.
+
 def _collect_namespaced_entries(
     mod_path: Path,
     patch_dir: Path,
@@ -140,7 +140,7 @@ def _collect_namespaced_entries(
     return entries
 
 
-# Collect the default patch entry.
+
 def _collect_default_entry(
     mod_path: Path,
     patch_dir: Path,
@@ -167,7 +167,7 @@ def _collect_default_entry(
     )
 
 
-# Find the INI file for a patch.
+
 def _find_ini_path(patch_dir: Path, final_path: Path, ini_name: str) -> Path | None:
     ini_candidates: list[Path] = []
     if ini_name:

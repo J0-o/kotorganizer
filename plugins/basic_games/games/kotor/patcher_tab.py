@@ -1,4 +1,4 @@
-﻿import configparser
+import configparser
 import json
 import logging
 import os
@@ -10,22 +10,16 @@ import time
 from pathlib import Path
 
 import mobase
-from PyQt6.QtCore import QPoint, QTimer, Qt, QUrl
-from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPalette
+from PyQt6.QtCore import QPoint, QSize, QTimer, Qt, QUrl
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QDialog,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QMenu,
-    QMessageBox,
-    QPlainTextEdit,
     QPushButton,
-    QStyle,
-    QStyleOptionSlider,
-    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -33,26 +27,55 @@ from PyQt6.QtWidgets import (
 )
 from patcher_entries import PatchEntry as _PatcherEntry
 from patcher_entries import collect_patch_entries, find_patch_dir, read_ini_with_fallbacks
-from tslpatcher_parser import TslPatcherOperation
 from ui_theme import (
     configure_refresh_button,
     configure_tree_widget,
+    mo2_archive_conflict_purple,
+    mo2_conflict_green,
     mo2_conflict_red,
     refresh_mo2,
     set_header_resize_mode,
-    tree_active_conflict_row_color,
-    tree_base_color,
     tree_conflict_row_color,
-    tree_highlight_color,
-    tree_hover_stylesheet,
+    tree_row_padding_stylesheet,
     tree_selected_marker_color,
 )
 
 logger = logging.getLogger("mobase")
-PATCHER_MOD_NAME = "[ PATCHER FILES ]"
+PATCHER_MOD_BASE_NAME = "[ PATCHER FILES ]"
+PATCHER_CATEGORY_NAME = "[ PATCHER ]"
+
+from patcher_constants import (
+    COL_CONFLICTS,
+    COL_DESCRIPTION,
+    COL_ENABLED,
+    COL_MOD,
+    COL_PATCH,
+    COL_PRIORITY,
+    PATCHER_CONFLICT_INFORMATIONAL,
+    PATCHER_CONFLICT_MIXED,
+    PATCHER_CONFLICT_OVERWRITTEN,
+    PATCHER_CONFLICT_OVERWRITE,
+    PATCHER_TREE_COLUMN_COUNT,
+    ROLE_CONFLICT_SORT,
+    ROLE_DESTINATION,
+    ROLE_FILES,
+    ROLE_INI_PATH,
+    ROLE_INSTALL_PATHS,
+    ROLE_OVERVIEW_COLOR,
+    ROLE_REQUIRED,
+    MO2_MOD_INDEX_ROLE,
+)
+from patcher_delegates import (
+    _ModListContainsFileDelegate,
+    _ModListScrollbarMarkerOverlay,
+    _PatcherCheckboxDelegate,
+    _PatcherConflictOverview,
+    _PatcherItem,
+)
+from patcher_dialogs import _PatcherDetailsDialog, _PatcherRunnerDialog
 
 
-# Convert a subset of RTF into readable plain text.
+
 def _rtf_to_text(rtf: str) -> str:
     out: list[str] = []
     stack: list[tuple[bool, bool]] = []
@@ -157,290 +180,9 @@ def _rtf_to_text(rtf: str) -> str:
     return text.strip()
 
 
-# Paint row markers next to the patch list scrollbar.
-class _PatcherConflictOverview(QWidget):
-    # Cache the tree and the row colors to paint.
-    def __init__(self, tree: QTreeWidget, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._tree = tree
-        self._row_colors: list[QColor | None] = []
-        self.setMinimumWidth(8)
-        self.setMaximumWidth(8)
 
-    # Update the colors used for the overview strip.
-    def set_row_colors(self, row_colors: list[QColor | None]):
-        self._row_colors = row_colors
-        self.update()
-
-    # Return the visible scrollbar track bounds.
-    def _track_rect(self) -> tuple[int, int]:
-        scroll_bar = self._tree.verticalScrollBar()
-        if scroll_bar is None:
-            return 0, self.height()
-
-        option = QStyleOptionSlider()
-        scroll_bar.initStyleOption(option)
-        style = scroll_bar.style()
-        sub_line_rect = style.subControlRect(
-            QStyle.ComplexControl.CC_ScrollBar,
-            option,
-            QStyle.SubControl.SC_ScrollBarSubLine,
-            scroll_bar,
-        )
-        add_line_rect = style.subControlRect(
-            QStyle.ComplexControl.CC_ScrollBar,
-            option,
-            QStyle.SubControl.SC_ScrollBarAddLine,
-            scroll_bar,
-        )
-
-        top = max(0, sub_line_rect.height())
-        bottom = self.height() - max(0, add_line_rect.height())
-        if self._tree.horizontalScrollBar().isVisible():
-            bottom -= self._tree.horizontalScrollBar().height()
-        if bottom <= top:
-            return 0, self.height()
-        return top, bottom
-
-    # Paint the overview strip beside the tree.
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
-        row_count = len(self._row_colors)
-        if row_count == 0 or self.height() <= 0:
-            return
-
-        track_top, track_bottom = self._track_rect()
-        track_height = track_bottom - track_top
-        if track_height <= 0:
-            return
-
-        width = self.width()
-        for index, color in enumerate(self._row_colors):
-            if color is None:
-                continue
-            top = track_top + int(index * track_height / row_count)
-            bottom = track_top + int((index + 1) * track_height / row_count)
-            height = max(2, bottom - top)
-            painter.fillRect(0, top, width, height, color)
-
-
-# Sort patch rows by numeric priority when needed.
-class _PatcherItem(QTreeWidgetItem):
-    # Compare two rows using the active tree sort column.
-    def __lt__(self, other: "QTreeWidgetItem") -> bool:
-        tree = self.treeWidget()
-        if tree and tree.sortColumn() == 4:
-            try:
-                return int(self.text(4)) < int(other.text(4))
-            except Exception:
-                pass
-        return super().__lt__(other)
-
-
-# Show full details for one patch entry.
-class _PatcherDetailsDialog(QDialog):
-    # Build the patch details dialog UI.
-    def __init__(
-        self,
-        parent: QWidget | None,
-        owner: "Kotor2PatcherTab",
-        entry: _PatcherEntry,
-        conflict_rows: list[tuple[str, str]],
-        info_text: str,
-        info_path: Path | None,
-        ini_text: str,
-        log_text: str,
-    ):
-        super().__init__(parent)
-        self._owner = owner
-        self._entry = entry
-        self.setWindowTitle(f"{entry.mod_name} / {entry.patch_name}")
-        self.resize(880, 620)
-
-        layout = QVBoxLayout(self)
-        tabs = QTabWidget(self)
-        layout.addWidget(tabs)
-
-        info_tab = QWidget(self)
-        info_layout = QVBoxLayout(info_tab)
-        info_meta = QPlainTextEdit(self)
-        info_meta.setReadOnly(True)
-        info_meta.setPlainText(
-            "\n".join(
-                [
-                    f"Mod: {entry.mod_name}",
-                    f"Patch: {entry.patch_name}",
-                    f"Description: {entry.description or '(none)'}",
-                    f"Priority: {entry.priority}",
-                    f"Enabled: {entry.enabled}",
-                    f"INI: {entry.ini_short_path}",
-                ]
-            )
-        )
-        info_rtf = QPlainTextEdit(self)
-        info_rtf.setReadOnly(True)
-        info_rtf.setPlainText(info_text or "No info file found.")
-        info_layout.addWidget(info_meta, 1)
-        if info_path and info_path.exists():
-            open_btn = QPushButton("Open info file", self)
-            open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(info_path))))
-            info_layout.addWidget(open_btn, 0)
-        info_layout.addWidget(info_rtf, 4)
-        tabs.addTab(info_tab, "Info")
-
-        ini_view = QPlainTextEdit(self)
-        ini_view.setReadOnly(True)
-        ini_view.setPlainText(ini_text or "No INI text found.")
-        tabs.addTab(ini_view, "Ini")
-
-        operations = QPlainTextEdit(self)
-        operations.setReadOnly(True)
-        operations.setPlainText(
-            "\n\n".join(
-                [
-                    "\n".join(
-                        [
-                            f"Type: {operation.resource_type}",
-                            f"Action: {operation.action}",
-                            f"Target: {operation.target}",
-                            f"Location: {operation.location}",
-                            f"Scope: {', '.join(operation.scope) if operation.scope else '(none)'}",
-                            f"Section: {operation.source_section}",
-                        ]
-                    )
-                    for operation in entry.operations
-                ]
-            )
-            or "No parsed operations."
-        )
-        tabs.addTab(operations, "Operations")
-
-        conflicts_tab = QWidget(self)
-        conflicts_layout = QVBoxLayout(conflicts_tab)
-        conflicts_tree = QTreeWidget(self)
-        conflicts_tree.setColumnCount(2)
-        conflicts_tree.setHeaderLabels(["Conflicting Mod", "Patch"])
-        configure_tree_widget(
-            conflicts_tree,
-            selection_mode=QAbstractItemView.SelectionMode.SingleSelection,
-            uniform_row_heights=True,
-        )
-        conflicts_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        conflicts_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        conflicts_view = QPlainTextEdit(self)
-        conflicts_view.setReadOnly(True)
-        conflicts_view.setPlaceholderText("Select a conflicting patch to view shared operations.")
-        for label, details in conflict_rows:
-            if " / " in label:
-                mod_name, patch_name = label.split(" / ", 1)
-            else:
-                mod_name, patch_name = label, ""
-            row = QTreeWidgetItem([mod_name, patch_name])
-            row.setData(0, Qt.ItemDataRole.UserRole, details)
-            conflicts_tree.addTopLevelItem(row)
-        if conflict_rows:
-            conflicts_tree.setCurrentItem(conflicts_tree.topLevelItem(0))
-            conflicts_view.setPlainText(str(conflicts_tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) or ""))
-        else:
-            conflicts_view.setPlainText("No enabled patch conflicts for this patch.")
-        conflicts_tree.itemClicked.connect(
-            lambda item, _column: conflicts_view.setPlainText(str(item.data(0, Qt.ItemDataRole.UserRole) or ""))
-        )
-        conflicts_layout.addWidget(conflicts_tree, 2)
-        conflicts_layout.addWidget(conflicts_view, 3)
-        tabs.addTab(conflicts_tab, "Conflicts")
-
-        log_view = QPlainTextEdit(self)
-        log_view.setReadOnly(True)
-        log_view.setPlainText(log_text or "No log file found for this patch.")
-        tabs.addTab(log_view, "Log")
-
-        test_tab = QWidget(self)
-        test_layout = QVBoxLayout(test_tab)
-        test_buttons = QHBoxLayout()
-        prepare_test_btn = QPushButton("Prepare Test", self)
-        prepare_test_btn.clicked.connect(self._prepare_test_install)
-        run_test_btn = QPushButton("Run Test", self)
-        run_test_btn.clicked.connect(self._run_test_install)
-        open_test_btn = QPushButton("Open Test Folder", self)
-        open_test_btn.clicked.connect(self._open_test_folder)
-        test_buttons.addWidget(prepare_test_btn)
-        test_buttons.addWidget(run_test_btn)
-        test_buttons.addWidget(open_test_btn)
-        test_buttons.addStretch()
-        test_layout.addLayout(test_buttons)
-
-        test_log = QPlainTextEdit(self)
-        test_log.setReadOnly(True)
-        test_log.setPlaceholderText("Single-patch prepare/run logs will appear here.")
-        self._test_log = test_log
-        test_layout.addWidget(test_log, 1)
-        tabs.addTab(test_tab, "Test")
-
-    # Prepare the selected test install.
-    def _prepare_test_install(self):
-        self._test_log.setPlainText(self._owner._prepare_test_entry(self._entry))
-
-    # Run the selected test install.
-    def _run_test_install(self):
-        self._test_log.setPlainText(self._owner._run_test_entry(self._entry))
-
-    # Open the test output folder.
-    def _open_test_folder(self):
-        test_dir = self._owner._test_entry_target_dir(self._entry)
-        if test_dir.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(test_dir)))
-
-
-# Show prepare and run controls for the patcher.
-class _PatcherRunnerDialog(QDialog):
-    # Build the runner dialog and wire its buttons.
-    def __init__(self, parent: QWidget | None, owner: "Kotor2PatcherTab"):
-        super().__init__(parent)
-        self._owner = owner
-        self.setWindowTitle("Patcher")
-        self.resize(860, 620)
-
-        layout = QVBoxLayout(self)
-        buttons = QHBoxLayout()
-        self._prepare_btn = QPushButton("Prepare", self)
-        self._prepare_btn.clicked.connect(self._owner._prepare_patcher_mod)
-        self._run_patcher_btn = QPushButton("Start", self)
-        self._run_patcher_btn.clicked.connect(self._owner._run_patcher)
-        self._stop_btn = QPushButton("Stop", self)
-        self._stop_btn.setAutoDefault(False)
-        self._stop_btn.setDefault(False)
-        self._stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.clicked.connect(self._owner._stop_patcher)
-        buttons.addWidget(self._prepare_btn)
-        buttons.addWidget(self._run_patcher_btn)
-        buttons.addWidget(self._stop_btn)
-        buttons.addStretch()
-        layout.addLayout(buttons)
-
-        self._log_box = QPlainTextEdit(self)
-        self._log_box.setReadOnly(True)
-        self._log_box.setPlaceholderText("Patcher prepare/run logs will appear here.")
-        layout.addWidget(self._log_box, 1)
-
-    # Replace the runner log text.
-    def set_log_text(self, text: str):
-        self._log_box.setPlainText(text)
-        self._log_box.verticalScrollBar().setValue(self._log_box.verticalScrollBar().maximum())
-
-    # Toggle the runner button state.
-    def set_running(self, running: bool):
-        self._prepare_btn.setEnabled(not running)
-        self._run_patcher_btn.setEnabled(not running)
-        self._stop_btn.setEnabled(running)
-
-
-# Render the main patcher tab inside MO2.
 class Kotor2PatcherTab(QWidget):
-    # Build the patcher tab UI and event hooks.
+
     def __init__(self, parent: QWidget | None, organizer: mobase.IOrganizer, game):
         super().__init__(parent)
         self._organizer = organizer
@@ -456,6 +198,10 @@ class Kotor2PatcherTab(QWidget):
         self._runner_dialog: _PatcherRunnerDialog | None = None
         self._runner_log_text = ""
         self._refresh_pending = False
+        self._mod_highlight_warning_logged = False
+        self._mod_list_highlight_delegate: _ModListContainsFileDelegate | None = None
+        self._mod_list_scrollbar_marker: _ModListScrollbarMarkerOverlay | None = None
+        self._patcher_row_size = QSize()
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -463,7 +209,7 @@ class Kotor2PatcherTab(QWidget):
         refresh_btn = QPushButton("Refresh")
         configure_refresh_button(refresh_btn)
         refresh_btn.clicked.connect(self._parse_and_refresh)
-        runner_btn = QPushButton("Patch")
+        runner_btn = QPushButton("Open Patcher")
         runner_btn.clicked.connect(self._open_runner_dialog)
         header.addWidget(refresh_btn)
         header.addWidget(self._summary_label)
@@ -472,29 +218,41 @@ class Kotor2PatcherTab(QWidget):
         layout.addLayout(header)
 
         self._tree = QTreeWidget()
-        self._tree.setColumnCount(5)
-        self._tree.setHeaderLabels(["Ena", "Mod", "Patch", "Description", "Priority"])
+        self._tree.setColumnCount(PATCHER_TREE_COLUMN_COUNT)
+        self._tree.setHeaderLabels(["Ena", "Conflicts", "Mod", "Patch", "Description", "Priority"])
         configure_tree_widget(
             self._tree,
-            selection_mode=QAbstractItemView.SelectionMode.NoSelection,
+            selection_mode=QAbstractItemView.SelectionMode.SingleSelection,
             uniform_row_heights=True,
+            alternating_rows=False,
             mouse_tracking=True,
         )
         self._apply_tree_style()
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.currentItemChanged.connect(self._on_current_item_changed)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        self._tree.setItemDelegateForColumn(COL_ENABLED, _PatcherCheckboxDelegate(self._tree))
         header_view = self._tree.header()
         header_view.setSectionsClickable(True)
-        set_header_resize_mode(header_view, QHeaderView.ResizeMode.Interactive, 5)
-        self._tree.setColumnWidth(0, 42)
-        self._tree.setColumnWidth(1, 220)
-        self._tree.setColumnWidth(2, 130)
-        self._tree.setColumnWidth(3, 560)
-        self._tree.setColumnWidth(4, 56)
-        self._tree.sortItems(4, Qt.SortOrder.AscendingOrder)
+        set_header_resize_mode(header_view, QHeaderView.ResizeMode.Interactive, PATCHER_TREE_COLUMN_COUNT)
+        self._tree.setIconSize(QSize(20, 20))
+        self._patcher_row_size = QSize(
+            0,
+            max(
+                self._tree.fontMetrics().height() + int(round(self._tree.fontMetrics().height() * 0.6)),
+                self._tree.iconSize().height(),
+            ),
+        )
+        self._tree.setColumnWidth(COL_ENABLED, 42)
+        self._tree.setColumnWidth(COL_CONFLICTS, 76)
+        self._tree.setColumnWidth(COL_MOD, 220)
+        self._tree.setColumnWidth(COL_PATCH, 130)
+        self._tree.setColumnWidth(COL_DESCRIPTION, 560)
+        self._tree.setColumnWidth(COL_PRIORITY, 56)
+        self._tree.sortItems(COL_PRIORITY, Qt.SortOrder.AscendingOrder)
         self._conflict_overview = _PatcherConflictOverview(self._tree)
         tree_layout = QHBoxLayout()
         tree_layout.setContentsMargins(0, 0, 0, 0)
@@ -527,44 +285,260 @@ class Kotor2PatcherTab(QWidget):
 
         self.schedule_refresh(immediate=True)
 
-    # Parse patch entries and refresh the tab.
+
     def _parse_and_refresh(self):
         if self._tree.topLevelItemCount():
             self._write_json()
         self.schedule_refresh(immediate=True)
 
-    # Return mods in profile priority order.
+
     def _profile_mod_order(self) -> list[str]:
         return list(self._organizer.modList().allModsByProfilePriority())
 
-    # Return MO2's conflict red color.
-    def _mo2_conflict_red(self) -> QColor:
-        return mo2_conflict_red()
 
-    # Return the base conflict color for the patcher tab.
-    def _theme_conflict_color(self) -> QColor:
-        return self._mo2_conflict_red()
+    def _current_profile_name(self) -> str:
+        profile_name = Path(self._organizer.profilePath()).name.strip()
+        profile_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", profile_name)
+        profile_name = re.sub(r"\s+", " ", profile_name).strip(" .")
+        return profile_name or "Default"
 
-    # Return the active conflict row color.
-    def _theme_active_conflict_color(self) -> QColor:
-        return tree_active_conflict_row_color(self._tree, self._theme_conflict_color(), 0.22)
 
-    # Return the passive conflict row color.
-    def _theme_conflict_background(self) -> QColor:
-        return tree_conflict_row_color(self._tree, self._theme_conflict_color(), 0.24)
+    def _patcher_mod_name(self) -> str:
+        return f"{PATCHER_MOD_BASE_NAME} {self._current_profile_name()}"
 
-    # Apply the hover styling for the patch tree.
+
+    def _patcher_mod_dir(self) -> Path:
+        return Path(self._organizer.modsPath()) / self._patcher_mod_name()
+
+
+    @staticmethod
+    def _is_patcher_output_mod(mod_name: str) -> bool:
+        return mod_name == PATCHER_MOD_BASE_NAME or mod_name.startswith(f"{PATCHER_MOD_BASE_NAME} ")
+
+
+    def _activate_patcher_output_mod(self, patcher_mod_name: str):
+        try:
+            mod_list = self._organizer.modList()
+            if mod_list.getMod(patcher_mod_name) is None:
+                refresh_mo2(self._organizer, self)
+            mod_list.setActive(patcher_mod_name, True)
+        except Exception as exc:
+            logger.debug("Unable to activate generated patcher output mod %s: %s", patcher_mod_name, exc)
+
+
+    def _mo2_mod_display_name(self, mod_name: str) -> str:
+        try:
+            display_name = str(self._organizer.modList().displayName(mod_name) or "").strip()
+            if display_name:
+                return display_name
+        except Exception:
+            pass
+        return mod_name
+
+
+    def _find_mo2_mod_model_index(self, model, display_name: str, parent=None):
+        row_count = model.rowCount(parent) if parent is not None else model.rowCount()
+        for row in range(row_count):
+            index = model.index(row, 0, parent) if parent is not None else model.index(row, 0)
+            if str(index.data(Qt.ItemDataRole.DisplayRole) or "") == display_name:
+                return index
+            child = self._find_mo2_mod_model_index(model, display_name, index)
+            if child is not None:
+                return child
+        return None
+
+
+    def _highlight_mo2_mod(self, mod_name: str):
+        mod_name = mod_name.strip()
+        if not mod_name:
+            return
+        mod_list_widget = self.window().findChild(QWidget, "modList")
+        if mod_list_widget is None:
+            return
+
+        try:
+            if not isinstance(mod_list_widget.itemDelegate(), _ModListContainsFileDelegate):
+                previous_delegate = mod_list_widget.itemDelegate()
+                self._mod_list_highlight_delegate = _ModListContainsFileDelegate(previous_delegate, mod_list_widget)
+                mod_list_widget.setItemDelegate(self._mod_list_highlight_delegate)
+            else:
+                self._mod_list_highlight_delegate = mod_list_widget.itemDelegate()
+
+            scroll_bar = mod_list_widget.verticalScrollBar()
+            if self._mod_list_scrollbar_marker is None or self._mod_list_scrollbar_marker.parent() is not scroll_bar:
+                self._mod_list_scrollbar_marker = _ModListScrollbarMarkerOverlay(mod_list_widget, scroll_bar)
+
+            display_name = self._mo2_mod_display_name(mod_name)
+            model_index = self._find_mo2_mod_model_index(mod_list_widget.model(), display_name)
+            mod_index = None
+            if model_index is not None:
+                try:
+                    mod_index = int(model_index.data(MO2_MOD_INDEX_ROLE))
+                except (TypeError, ValueError):
+                    mod_index = None
+            self._mod_list_highlight_delegate.set_highlighted_mod(display_name, mod_index)
+            self._mod_list_scrollbar_marker.set_highlighted_mod(display_name, mod_index)
+        except Exception as ex:
+            if not self._mod_highlight_warning_logged:
+                self._mod_highlight_warning_logged = True
+                logger.debug("Unable to highlight MO2 mod list entry for %s: %s", mod_name, ex)
+
+
+    @staticmethod
+    def _patch_conflict_icon(conflict_state: str) -> QIcon:
+        resource_paths = {
+            PATCHER_CONFLICT_MIXED: ":/MO/gui/emblem_conflict_mixed",
+            PATCHER_CONFLICT_OVERWRITE: ":/MO/gui/emblem_conflict_overwrite",
+            PATCHER_CONFLICT_OVERWRITTEN: ":/MO/gui/emblem_conflict_overwritten",
+            PATCHER_CONFLICT_INFORMATIONAL: ":/MO/gui/archive_conflict_mixed",
+        }
+        return QIcon(resource_paths.get(conflict_state, ""))
+
+
+    @staticmethod
+    def _patch_conflict_sort_weight(conflict_state: str) -> int:
+        weights = {
+            PATCHER_CONFLICT_OVERWRITTEN: 1,
+            PATCHER_CONFLICT_INFORMATIONAL: 2,
+            PATCHER_CONFLICT_OVERWRITE: 3,
+            PATCHER_CONFLICT_MIXED: 4,
+        }
+        return weights.get(conflict_state, 0)
+
+
+    @staticmethod
+    def _hard_operation_conflict_keys(entry: _PatcherEntry) -> set[str]:
+        return {
+            key
+            for operation in entry.operations
+            if operation.action == "replace"
+            for key in operation.conflict_keys()
+        }
+
+
+    @staticmethod
+    def _informational_operation_conflict_keys(entry: _PatcherEntry) -> set[str]:
+        keys: set[str] = set()
+        for operation in entry.operations:
+            if operation.action not in {"install", "patch"}:
+                continue
+            target = operation.target.strip().lower()
+            if not target:
+                continue
+            keys.add(f"{operation.action}:{operation.resource_type}:{target}")
+        return keys
+
+
+    def _build_patch_conflict_states(
+        self, entries: list[_PatcherEntry]
+    ) -> dict[str, tuple[str, str]]:
+        enabled_entries = [entry for entry in entries if entry.enabled]
+        hard_keys_by_entry = {
+            f"{entry.mod_name}::{entry.patch_name}": self._hard_operation_conflict_keys(entry)
+            for entry in enabled_entries
+        }
+        info_keys_by_entry = {
+            f"{entry.mod_name}::{entry.patch_name}": self._informational_operation_conflict_keys(entry)
+            for entry in enabled_entries
+        }
+        order_index = {f"{entry.mod_name}::{entry.patch_name}": index for index, entry in enumerate(enabled_entries)}
+        conflicts: dict[str, dict[str, set[str]]] = {
+            entry_key: {"overwrites": set(), "overwritten": set(), "same": set()}
+            for entry_key, keys in hard_keys_by_entry.items()
+            if keys
+        }
+        informational_conflicts: dict[str, set[str]] = {
+            entry_key: set()
+            for entry_key, keys in info_keys_by_entry.items()
+            if keys
+        }
+
+        for left_index, left in enumerate(enabled_entries):
+            left_key = f"{left.mod_name}::{left.patch_name}"
+            left_hard_keys = hard_keys_by_entry.get(left_key, set())
+            left_info_keys = info_keys_by_entry.get(left_key, set())
+            for right in enabled_entries[left_index + 1 :]:
+                right_key = f"{right.mod_name}::{right.patch_name}"
+                left_label = f"{left.mod_name} / {left.patch_name}"
+                right_label = f"{right.mod_name} / {right.patch_name}"
+                if left_info_keys.intersection(info_keys_by_entry.get(right_key, set())):
+                    informational_conflicts.setdefault(left_key, set()).add(right_label)
+                    informational_conflicts.setdefault(right_key, set()).add(left_label)
+
+                shared_keys = left_hard_keys.intersection(hard_keys_by_entry.get(right_key, set()))
+                if not shared_keys:
+                    continue
+
+                left_rank = (left.priority, order_index[left_key])
+                right_rank = (right.priority, order_index[right_key])
+                if left.priority == right.priority:
+                    conflicts.setdefault(left_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "same"
+                    ].add(right_label)
+                    conflicts.setdefault(right_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "same"
+                    ].add(left_label)
+                elif left_rank > right_rank:
+                    conflicts.setdefault(left_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "overwrites"
+                    ].add(right_label)
+                    conflicts.setdefault(right_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "overwritten"
+                    ].add(left_label)
+                else:
+                    conflicts.setdefault(left_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "overwritten"
+                    ].add(right_label)
+                    conflicts.setdefault(right_key, {"overwrites": set(), "overwritten": set(), "same": set()})[
+                        "overwrites"
+                    ].add(left_label)
+
+        states: dict[str, tuple[str, str]] = {}
+        for entry_key, buckets in conflicts.items():
+            has_overwrites = bool(buckets["overwrites"])
+            has_overwritten = bool(buckets["overwritten"])
+            has_same = bool(buckets["same"])
+            if has_same or (has_overwrites and has_overwritten):
+                state = PATCHER_CONFLICT_MIXED
+                summary = "Patch operation conflicts overwrite and are overwritten."
+            elif has_overwrites:
+                state = PATCHER_CONFLICT_OVERWRITE
+                summary = "Patch operation conflicts overwrite lower-priority patches."
+            elif has_overwritten:
+                state = PATCHER_CONFLICT_OVERWRITTEN
+                summary = "Patch operation conflicts are overwritten by higher-priority patches."
+            else:
+                continue
+
+            lines = [summary]
+            if buckets["overwrites"]:
+                lines.append("Overwrites: " + "; ".join(sorted(buckets["overwrites"])))
+            if buckets["overwritten"]:
+                lines.append("Overwritten by: " + "; ".join(sorted(buckets["overwritten"])))
+            if buckets["same"]:
+                lines.append("Same-priority conflicts: " + "; ".join(sorted(buckets["same"])))
+            states[entry_key] = (state, "\n".join(lines))
+        for entry_key, labels in informational_conflicts.items():
+            if not labels or entry_key in states:
+                continue
+            states[entry_key] = (
+                PATCHER_CONFLICT_INFORMATIONAL,
+                "Patch operations touch the same broad targets.\nInformational overlaps: " + "; ".join(sorted(labels)),
+            )
+        return states
+
+
     def _apply_tree_style(self):
-        self._tree.setStyleSheet(tree_hover_stylesheet(self._tree, 0.34))
+        self._tree.setStyleSheet(tree_row_padding_stylesheet())
 
-    # Refresh tree styling when the Qt palette changes.
+
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() in (event.Type.PaletteChange, event.Type.StyleChange):
             self._apply_tree_style()
             self._rebuild_tree_from_entries()
 
-    # Start watching mod order changes while visible.
+
     def showEvent(self, event):
         super().showEvent(event)
         self._last_profile_order = tuple(self._profile_mod_order())
@@ -572,12 +546,12 @@ class Kotor2PatcherTab(QWidget):
         if self._refresh_pending or not self._tree.topLevelItemCount():
             self.schedule_refresh(immediate=True)
 
-    # Stop watching mod order changes while hidden.
+
     def hideEvent(self, event):
         self._order_watch_timer.stop()
         super().hideEvent(event)
 
-    # Refresh the tab if MO2 mod priority changes.
+
     def _check_mod_order_changed(self):
         current_order = tuple(self._profile_mod_order())
         if current_order == self._last_profile_order:
@@ -585,17 +559,17 @@ class Kotor2PatcherTab(QWidget):
         self._last_profile_order = current_order
         self.schedule_refresh()
 
-    # Find the patch data folder inside one mod.
+
     def _find_patch_dir(self, mod_path: Path) -> Path | None:
         return find_patch_dir(mod_path)
 
-    # Disable active TSLPatcher mods before preparing the patcher mod.
+
     def _disable_active_tslpatcher_mods(self) -> list[str]:
         disabled: list[str] = []
         mod_list = self._organizer.modList()
         mods_root = Path(self._organizer.modsPath())
         for mod_name in self._profile_mod_order():
-            if mod_name == PATCHER_MOD_NAME:
+            if self._is_patcher_output_mod(mod_name):
                 continue
             if not (mod_list.state(mod_name) & mobase.ModState.ACTIVE):
                 continue
@@ -608,7 +582,7 @@ class Kotor2PatcherTab(QWidget):
             disabled.append(mod_name)
         return disabled
 
-    # Load the saved enabled-state map from disk.
+
     def _load_enabled_state(self) -> dict[tuple[str, str], bool]:
         enabled: dict[tuple[str, str], bool] = {}
         mod_list = self._organizer.modList()
@@ -625,7 +599,7 @@ class Kotor2PatcherTab(QWidget):
                 logger.warning("[KOTOR2] Failed to read patcher JSON state: %s", e)
         return enabled
 
-    # Collect patch entries from active patcher mods.
+
     def _collect_patch_entries(self) -> list[_PatcherEntry]:
         mods_root = Path(self._organizer.modsPath())
         order = self._profile_mod_order()
@@ -635,37 +609,41 @@ class Kotor2PatcherTab(QWidget):
             mod_name: bool(mod_list.state(mod_name) & mobase.ModState.ACTIVE)
             for mod_name in order
         }
-        return collect_patch_entries(mods_root, order, enabled_state, active_state)
+        entries = collect_patch_entries(mods_root, order, enabled_state, active_state)
+        self._ensure_patcher_category(entries)
+        return entries
 
-    # Build human-readable duplicate conflict text.
-    def _build_duplicate_text(self, entries: list[_PatcherEntry]) -> str:
-        dup_map: dict[str, set[str]] = {}
-        for entry in entries:
-            for operation in entry.operations:
-                for conflict_key in operation.conflict_keys():
-                    dup_map.setdefault(conflict_key, set()).add(f"{entry.mod_name} / {entry.patch_name}")
-        duplicates = sorted((name, mods) for name, mods in dup_map.items() if len(mods) > 1)
-        if not duplicates:
-            return "No parser-detected TSLPatcher conflicts found."
-        return "\n\n".join(f"{name} - {'; '.join(sorted(mods))}" for name, mods in duplicates)
 
-    # Split a stored semicolon-delimited field.
+    def _ensure_patcher_category(self, entries: list[_PatcherEntry]) -> None:
+        mod_list = self._organizer.modList()
+        for mod_name in sorted({entry.mod_name for entry in entries}):
+            try:
+                mod = mod_list.getMod(mod_name)
+                if mod is None:
+                    continue
+                categories = {str(category) for category in mod.categories()}
+                if PATCHER_CATEGORY_NAME not in categories:
+                    mod.addCategory(PATCHER_CATEGORY_NAME)
+            except Exception as exc:
+                logger.warning("[KOTOR] Failed to assign patcher category to %s: %s", mod_name, exc)
+
+
     @staticmethod
     def _split_semicolon_list(value: str) -> list[str]:
         return [part.strip() for part in value.split(";") if part.strip()]
 
-    # Normalize a relative path for lookups.
+
     @staticmethod
     def _normalize_relpath(value: str) -> str:
         return value.strip().strip("\\/").replace("/", "\\").lower()
 
-    # Detect texture-like targets that should be treated specially.
+
     @staticmethod
     def _is_texture_target(target: str) -> bool:
         suffix = Path(target).suffix.lower()
         return suffix in {".tpc", ".tga", ".txi", ".mdl", ".mdx", ".wav"}
 
-    # Build the set of virtual file targets needed by one patch.
+
     def _entry_vfs_targets(self, entry: _PatcherEntry) -> set[str]:
         targets: set[str] = set()
         required_targets = {
@@ -713,7 +691,7 @@ class Kotor2PatcherTab(QWidget):
 
         return {target for target in targets if target and "::" not in target}
 
-    # Resolve one target against the active mod stack and game roots.
+
     def _resolve_vfs_file(self, target: str) -> tuple[Path | None, str, str]:
         normalized = self._normalize_relpath(target)
         if not normalized:
@@ -727,7 +705,7 @@ class Kotor2PatcherTab(QWidget):
         mods_root = Path(self._organizer.modsPath())
         active_mods: list[Path] = []
         for mod_name in reversed(self._profile_mod_order()):
-            if mod_name == PATCHER_MOD_NAME:
+            if self._is_patcher_output_mod(mod_name):
                 continue
             if not (self._organizer.modList().state(mod_name) & mobase.ModState.ACTIVE):
                 continue
@@ -777,7 +755,7 @@ class Kotor2PatcherTab(QWidget):
         trace.append("not found in active mods or mapped game roots")
         return None, normalized, "\n".join(trace)
 
-    # Clear the generated patcher mod directory.
+
     def _clear_patcher_mod_dir(self, patcher_dir: Path):
         patcher_dir.mkdir(parents=True, exist_ok=True)
         for child in patcher_dir.iterdir():
@@ -792,7 +770,7 @@ class Kotor2PatcherTab(QWidget):
                 except FileNotFoundError:
                     pass
 
-    # Create dummy game executables required by HoloPatcher.
+
     @staticmethod
     def _ensure_dummy_game_exes(patcher_dir: Path):
         dummy_bytes = bytes(range(256))
@@ -802,7 +780,7 @@ class Kotor2PatcherTab(QWidget):
                 continue
             exe_path.write_bytes(dummy_bytes)
 
-    # Remove dummy game executables after patching.
+
     @staticmethod
     def _remove_dummy_game_exes(patcher_dir: Path):
         for exe_name in ("swkotor2.exe", "swkotor.exe"):
@@ -814,7 +792,7 @@ class Kotor2PatcherTab(QWidget):
             except FileNotFoundError:
                 pass
 
-    # Prepare one target folder with the virtual files required by the given entries.
+
     def _prepare_target_dir_for_entries(
         self,
         target_dir: Path,
@@ -851,6 +829,7 @@ class Kotor2PatcherTab(QWidget):
                 ]
             )
             if update_runner_log:
+                self._set_runner_activity(f"Preparing {entry_index}/{len(targets_by_entry)}")
                 self._set_status_with_prefix(log_prefix, progress)
 
             for target in targets:
@@ -891,19 +870,19 @@ class Kotor2PatcherTab(QWidget):
             ]
         )
 
-    # Replace the runner status text.
+
     def _set_status_text(self, text: str):
         self._runner_log_text = text
         if self._runner_dialog is not None:
             self._runner_dialog.set_log_text(text)
         QApplication.processEvents()
 
-    # Replace the runner status text with a preserved prefix block.
+
     def _set_status_with_prefix(self, prefix: str, text: str):
         combined = f"{prefix.rstrip()}\n\n{text}" if prefix else text
         self._set_status_text(combined)
 
-    # Append text to the runner log.
+
     def _append_status_text(self, text: str):
         if self._runner_log_text:
             self._runner_log_text = f"{self._runner_log_text.rstrip()}\n\n{text}"
@@ -913,12 +892,17 @@ class Kotor2PatcherTab(QWidget):
             self._runner_dialog.set_log_text(self._runner_log_text)
         QApplication.processEvents()
 
-    # Toggle the runner dialog busy state.
-    def _set_runner_busy(self, running: bool):
-        if self._runner_dialog is not None:
-            self._runner_dialog.set_running(running)
 
-    # Show the runner dialog.
+    def _set_runner_busy(self, running: bool, status: str = "Running"):
+        if self._runner_dialog is not None:
+            self._runner_dialog.set_running(running, status)
+
+
+    def _set_runner_activity(self, status: str):
+        if self._runner_dialog is not None:
+            self._runner_dialog.set_busy_status(status)
+
+
     def _open_runner_dialog(self):
         if self._runner_dialog is None:
             self._runner_dialog = _PatcherRunnerDialog(self, self)
@@ -929,10 +913,12 @@ class Kotor2PatcherTab(QWidget):
         self._runner_dialog.activateWindow()
         self.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    # Request cancellation of the current prepare or run.
+
     def _stop_patcher(self):
         self._stop_patcher_requested = True
         self._append_status_text("Stop requested.")
+        if self._runner_dialog is not None:
+            self._runner_dialog.set_running(True, "Stopping")
         process = self._current_patcher_process
         if process is not None and process.poll() is None:
             try:
@@ -940,19 +926,20 @@ class Kotor2PatcherTab(QWidget):
             except Exception:
                 pass
 
-    # Prepare the generated patcher mod before running patches.
-    def _prepare_patcher_mod(self, silent: bool = False, manage_busy: bool = True):
+
+    def _prepare_patcher_mod(self, manage_busy: bool = True):
         enabled_entries = [entry for entry in self._entries if entry.enabled]
         if not enabled_entries:
             self._set_status_text("No enabled patches to prepare.")
             return
 
-        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
+        patcher_mod_name = self._patcher_mod_name()
+        patcher_dir = self._patcher_mod_dir()
         self._stop_patcher_requested = False
         if manage_busy:
-            self._set_runner_busy(True)
+            self._set_runner_busy(True, "Preparing")
         try:
-            self._set_status_text(f"Preparing {PATCHER_MOD_NAME}...\nClearing target folder...")
+            self._set_status_text(f"Preparing {patcher_mod_name}...\nClearing target folder...")
             disabled_mods = self._disable_active_tslpatcher_mods()
             if disabled_mods:
                 self._refresh_now()
@@ -960,22 +947,22 @@ class Kotor2PatcherTab(QWidget):
                     "Disabled active TSLPatcher mods in MO2 before prepare:\n" + "\n".join(disabled_mods)
                 )
             log_prefix = self._runner_log_text
-            prepare_log = self._prepare_target_dir_for_entries(patcher_dir, enabled_entries, PATCHER_MOD_NAME, log_prefix)
+            prepare_log = self._prepare_target_dir_for_entries(patcher_dir, enabled_entries, patcher_mod_name, log_prefix)
+            self._activate_patcher_output_mod(patcher_mod_name)
             self._set_status_with_prefix(log_prefix, prepare_log)
         finally:
             if manage_busy:
                 self._set_runner_busy(False)
 
-    # Clear the generated [ PATCHER FILES ] folder without restaging patch files.
-    def clear_generated_patcher_mod(self):
-        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
-        self._clear_patcher_mod_dir(patcher_dir)
 
-    # Return the isolated test target folder for one entry.
+    def clear_generated_patcher_mod(self):
+        self._clear_patcher_mod_dir(self._patcher_mod_dir())
+
+
     def _test_entry_target_dir(self, entry: _PatcherEntry) -> Path:
         return Path(__file__).resolve().parent / "test" / self._safe_name(f"{entry.mod_name}_{entry.patch_name}")
 
-    # Prepare one patch entry into its isolated test target folder.
+
     def _prepare_test_entry(self, entry: _PatcherEntry) -> str:
         self._stop_patcher_requested = False
         test_dir = self._test_entry_target_dir(entry)
@@ -986,7 +973,7 @@ class Kotor2PatcherTab(QWidget):
             update_runner_log=False,
         )
 
-    # Run one patch entry against its isolated test target folder.
+
     def _run_test_entry(self, entry: _PatcherEntry) -> str:
         exe_path = Path(__file__).resolve().parent / "HoloPatcher.exe"
         temp_root = Path(__file__).resolve().parent / "temp"
@@ -1072,32 +1059,18 @@ class Kotor2PatcherTab(QWidget):
             self._current_patcher_process = None
             self._remove_tree_if_exists(temp_root)
 
-    # Sanitize a string for temp file and log names.
+
     @staticmethod
     def _safe_name(value: str) -> str:
         return re.sub(r"[^\w\-.]+", "_", value)
 
-    # Build a natural sort key for multipart names.
-    @staticmethod
-    def _natural_sort_key(value: str) -> tuple[object, ...]:
-        parts = re.split(r"(\d+)", value.lower())
-        key: list[object] = []
-        for part in parts:
-            if not part:
-                continue
-            if part.isdigit():
-                key.append(int(part))
-            else:
-                key.append(part)
-        return tuple(key)
 
-    # Remove a folder tree when it exists.
     @classmethod
     def _remove_tree_if_exists(cls, path: Path) -> None:
         if path.exists():
             cls._remove_tree(path)
 
-    # Remove a folder tree with Windows read-only retry.
+
     @staticmethod
     def _remove_tree(path: Path) -> None:
         def _retry_writeable(function, failed_path, exc_info):
@@ -1109,20 +1082,27 @@ class Kotor2PatcherTab(QWidget):
 
         shutil.rmtree(path, onerror=_retry_writeable)
 
-    # Return enabled entries in the current tree order.
+
     def _run_order_entries(self) -> list[_PatcherEntry]:
-        by_key = {f"{entry.mod_name}::{entry.patch_name}": entry for entry in self._entries}
-        ordered_entries: list[_PatcherEntry] = []
+        enabled_by_key: dict[str, bool] = {}
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
-            if item.checkState(0) != Qt.CheckState.Checked:
-                continue
-            entry = by_key.get(self._entry_key(item))
-            if entry is not None:
-                ordered_entries.append(entry)
-        return ordered_entries
+            enabled_by_key[self._entry_key(item)] = item.checkState(COL_ENABLED) == Qt.CheckState.Checked
 
-    # Parse the summary values from one HoloPatcher log.
+        enabled_entries = [
+            entry
+            for entry in self._entries
+            if enabled_by_key.get(f"{entry.mod_name}::{entry.patch_name}", entry.enabled)
+        ]
+        return [
+            entry
+            for _original_index, entry in sorted(
+                enumerate(enabled_entries),
+                key=lambda item: (item[1].priority, item[0]),
+            )
+        ]
+
+
     @staticmethod
     def _parse_install_log_summary(install_log_text: str) -> tuple[str, int, int, bool]:
         cleaned_lines: list[str] = []
@@ -1151,12 +1131,12 @@ class Kotor2PatcherTab(QWidget):
         cleaned_text = "\n".join(cleaned_lines).strip()
         return cleaned_text, error_count, warning_count, aborted
 
-    # Find the base patch directory for an entry.
+
     def _find_entry_patch_dir(self, entry: _PatcherEntry) -> Path | None:
         mod_path = Path(self._organizer.modsPath()) / entry.mod_name
         return self._find_patch_dir(mod_path)
 
-    # Resolve the INI path for an entry.
+
     def _entry_ini_path(self, entry: _PatcherEntry) -> Path | None:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
@@ -1167,14 +1147,14 @@ class Kotor2PatcherTab(QWidget):
         fallback = patch_dir / "changes.ini"
         return fallback if fallback.exists() else None
 
-    # Resolve the best folder to reveal for an entry.
+
     def _entry_open_folder_path(self, entry: _PatcherEntry) -> Path | None:
         ini_path = self._entry_ini_path(entry)
         if ini_path is not None:
             return ini_path.parent
         return self._find_entry_patch_dir(entry)
 
-    # Read the namespace-specific info filename for an entry.
+
     def _entry_namespace_info_name(self, entry: _PatcherEntry) -> str:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
@@ -1196,7 +1176,7 @@ class Kotor2PatcherTab(QWidget):
 
         return parser.get(entry.patch_name, "InfoName", fallback="").strip()
 
-    # Resolve the best info.rtf candidate for an entry.
+
     def _entry_info_rtf_path(self, entry: _PatcherEntry) -> Path | None:
         ini_path = self._entry_ini_path(entry)
         patch_dir = self._find_entry_patch_dir(entry)
@@ -1225,12 +1205,12 @@ class Kotor2PatcherTab(QWidget):
                 return candidate
         return None
 
-    # Return the stored log path for an entry.
+
     def _entry_log_path(self, entry: _PatcherEntry) -> Path:
         log_dir = Path(__file__).resolve().parent / "logs"
         return log_dir / f"{self._safe_name(f'{entry.mod_name} / {entry.patch_name}')}.txt"
 
-    # Extract plain text from an RTF info file.
+
     def _extract_rtf_text(self, rtf_path: Path) -> str | None:
         if not rtf_path.exists():
             return None
@@ -1240,7 +1220,7 @@ class Kotor2PatcherTab(QWidget):
         except Exception:
             return None
 
-    # Stage one patch into a temp folder for execution.
+
     def _stage_patch_for_run(self, entry: _PatcherEntry, temp_root: Path) -> tuple[Path | None, str]:
         patch_dir = self._find_entry_patch_dir(entry)
         if patch_dir is None:
@@ -1289,14 +1269,14 @@ class Kotor2PatcherTab(QWidget):
 
         return temp_mod, ""
 
-    # Run the enabled patch entries through HoloPatcher.
+
     def _run_patcher(self):
         enabled_entries = self._run_order_entries()
         if not enabled_entries:
             self._set_status_text("No enabled patches to run.")
             return
 
-        patcher_dir = Path(self._organizer.modsPath()) / PATCHER_MOD_NAME
+        patcher_dir = self._patcher_mod_dir()
         exe_path = Path(__file__).resolve().parent / "HoloPatcher.exe"
         temp_root = Path(__file__).resolve().parent / "temp"
         log_dir = Path(__file__).resolve().parent / "logs"
@@ -1306,9 +1286,9 @@ class Kotor2PatcherTab(QWidget):
             return
 
         self._stop_patcher_requested = False
-        self._set_runner_busy(True)
+        self._set_runner_busy(True, "Running")
         try:
-            self._prepare_patcher_mod(silent=True, manage_busy=False)
+            self._prepare_patcher_mod(manage_busy=False)
             if self._stop_patcher_requested:
                 self._append_status_text("Run stopped by user during prepare.")
                 return
@@ -1329,6 +1309,7 @@ class Kotor2PatcherTab(QWidget):
                     break
                 label = f"{entry.mod_name} / {entry.patch_name}"
                 lines.append(f"[{index}/{len(enabled_entries)}] {label}")
+                self._set_runner_activity(f"Running {index}/{len(enabled_entries)}")
                 self._set_status_text(f"{self._runner_log_text.rstrip()}\n[{index}/{len(enabled_entries)}] {label}")
 
                 temp_mod, error = self._stage_patch_for_run(entry, temp_root)
@@ -1372,6 +1353,8 @@ class Kotor2PatcherTab(QWidget):
                         install_log_text, patch_error_count, patch_warning_count, patch_aborted = self._parse_install_log_summary(raw_install_log)
                         warning_count += patch_warning_count
                         error_count += patch_error_count
+                        if patch_aborted and patch_error_count == 0:
+                            error_count += 1
                         if patch_warning_count and label not in warning_mods:
                             warning_mods.append(label)
                         if patch_error_count and label not in error_mods:
@@ -1435,51 +1418,29 @@ class Kotor2PatcherTab(QWidget):
             self._remove_dummy_game_exes(patcher_dir)
             refresh_mo2(self._organizer, self)
 
-    # Collapse operation conflict keys into a stored string.
-    @staticmethod
-    def _conflict_key_string(operations: tuple[TslPatcherOperation, ...]) -> str:
-        keys: list[str] = []
-        seen: set[str] = set()
-        for operation in operations:
-            for conflict_key in operation.conflict_keys():
-                if conflict_key not in seen:
-                    seen.add(conflict_key)
-                    keys.append(conflict_key)
-        return "; ".join(keys)
 
-    # Split a stored conflict-key string.
-    @staticmethod
-    def _split_conflict_keys(value: str) -> set[str]:
-        return {part.strip() for part in value.split(";") if part.strip()}
-
-    # Build the stable key for one tree row.
     @staticmethod
     def _entry_key(item: QTreeWidgetItem) -> str:
-        return f"{item.text(1)}::{item.text(2)}"
+        return f"{item.text(COL_MOD)}::{item.text(COL_PATCH)}"
 
-    # Build the conflict summary text for the selected row.
-    def _selected_conflict_text(self, active_item: QTreeWidgetItem) -> str:
-        rows = self._selected_conflict_rows(active_item)
-        active_label = f"{active_item.text(1)} / {active_item.text(2)}"
-        if not rows:
-            if active_item.checkState(0) != Qt.CheckState.Checked:
-                return "Selected patch is disabled. Enable it to inspect active conflicts."
-            active_keys = self._split_conflict_keys(str(active_item.data(0, Qt.ItemDataRole.UserRole + 5) or ""))
-            if not active_keys:
-                return "Selected patch does not expose any parser-detected operations."
-            return f"No enabled patch conflicts for {active_label}."
 
-        return f"Conflicts for {active_label}:\n\n" + "\n\n".join(
-            f"{label}\nShared operations:\n{details}" for label, details in rows
+    def _entry_by_key(self, entry_key: str) -> _PatcherEntry | None:
+        return next(
+            (entry for entry in self._entries if f"{entry.mod_name}::{entry.patch_name}" == entry_key),
+            None,
         )
 
-    # Collect the rows that conflict with the selected row.
+
     def _selected_conflict_rows(self, active_item: QTreeWidgetItem) -> list[tuple[str, str]]:
-        if active_item.checkState(0) != Qt.CheckState.Checked:
+        if active_item.checkState(COL_ENABLED) != Qt.CheckState.Checked:
             return []
 
-        active_keys = self._split_conflict_keys(str(active_item.data(0, Qt.ItemDataRole.UserRole + 5) or ""))
-        if not active_keys:
+        active_entry = self._entry_by_key(self._entry_key(active_item))
+        if active_entry is None:
+            return []
+        active_hard_keys = self._hard_operation_conflict_keys(active_entry)
+        active_info_keys = self._informational_operation_conflict_keys(active_entry)
+        if not active_hard_keys and not active_info_keys:
             return []
 
         conflicts: list[tuple[str, str]] = []
@@ -1487,28 +1448,25 @@ class Kotor2PatcherTab(QWidget):
             item = self._tree.topLevelItem(i)
             if item is active_item:
                 continue
-            if item.checkState(0) != Qt.CheckState.Checked:
+            if item.checkState(COL_ENABLED) != Qt.CheckState.Checked:
                 continue
-            shared_keys = sorted(
-                active_keys.intersection(
-                    self._split_conflict_keys(str(item.data(0, Qt.ItemDataRole.UserRole + 5) or ""))
-                )
-            )
-            if not shared_keys:
+            entry = self._entry_by_key(self._entry_key(item))
+            if entry is None:
                 continue
-            other_label = f"{item.text(1)} / {item.text(2)}"
-            conflicts.append((other_label, "\n".join(shared_keys)))
+            shared_hard_keys = sorted(active_hard_keys.intersection(self._hard_operation_conflict_keys(entry)))
+            shared_info_keys = sorted(active_info_keys.intersection(self._informational_operation_conflict_keys(entry)))
+            if not shared_hard_keys and not shared_info_keys:
+                continue
+            other_label = f"{item.text(COL_MOD)} / {item.text(COL_PATCH)}"
+            details: list[str] = []
+            if shared_hard_keys:
+                details.append("Hard conflicts (replace):\n" + "\n".join(shared_hard_keys))
+            if shared_info_keys:
+                details.append("Informational overlaps (install/patch):\n" + "\n".join(shared_info_keys))
+            conflicts.append((other_label, "\n\n".join(details)))
         return conflicts
 
-    # Resolve conflict text by entry key.
-    def _selected_conflict_text_by_key(self, entry_key: str) -> str:
-        for i in range(self._tree.topLevelItemCount()):
-            item = self._tree.topLevelItem(i)
-            if self._entry_key(item) == entry_key:
-                return self._selected_conflict_text(item)
-        return "Selected patch is no longer present in the current patch list."
 
-    # Refresh the scrollbar overview colors.
     def _update_conflict_overview(self, *_args):
         if not hasattr(self, "_conflict_overview"):
             return
@@ -1517,14 +1475,14 @@ class Kotor2PatcherTab(QWidget):
         selected_marker = tree_selected_marker_color(self._tree)
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
-            color_name = item.data(0, Qt.ItemDataRole.UserRole + 6)
+            color_name = item.data(COL_ENABLED, ROLE_OVERVIEW_COLOR)
             color = QColor(str(color_name)) if color_name else None
             if item is selected_item:
                 color = color if color is not None else selected_marker
             row_colors.append(color)
         self._conflict_overview.set_row_colors(row_colors)
 
-    # Build row brushes for the active conflict set.
+
     def _build_conflict_styles(self, entries: list[_PatcherEntry]) -> tuple[dict[str, QBrush], dict[str, QColor]]:
         conflict_brushes: dict[str, QBrush] = {}
         overview_colors: dict[str, QColor] = {}
@@ -1541,89 +1499,132 @@ class Kotor2PatcherTab(QWidget):
         if active_entry is None:
             return conflict_brushes, overview_colors
 
-        active_keys = {key for op in active_entry.operations for key in op.conflict_keys()}
-        if not active_keys:
+        active_hard_keys = self._hard_operation_conflict_keys(active_entry)
+        active_info_keys = self._informational_operation_conflict_keys(active_entry)
+        if not active_hard_keys and not active_info_keys:
             return conflict_brushes, overview_colors
 
-        active_color = self._theme_active_conflict_color()
-        conflict_brushes[self._active_conflict_key] = QBrush(active_color)
-        overview_colors[self._active_conflict_key] = active_color
+        priority_order = {
+            f"{entry.mod_name}::{entry.patch_name}": index
+            for index, (_original_index, entry) in enumerate(
+                sorted(enumerate(entries), key=lambda item: (item[1].priority, item[0]))
+            )
+        }
+        active_rank = priority_order.get(self._active_conflict_key)
+        if active_rank is None:
+            return conflict_brushes, overview_colors
+
+        overview_colors[self._active_conflict_key] = tree_selected_marker_color(self._tree)
         for entry in entries:
             if not entry.enabled:
                 continue
             entry_key = f"{entry.mod_name}::{entry.patch_name}"
             if entry_key == self._active_conflict_key:
                 continue
-            entry_keys = {key for op in entry.operations for key in op.conflict_keys()}
-            if active_keys.intersection(entry_keys):
-                conflict_color = self._theme_conflict_background()
+
+            has_hard_conflict = bool(active_hard_keys.intersection(self._hard_operation_conflict_keys(entry)))
+            has_info_conflict = bool(active_info_keys.intersection(self._informational_operation_conflict_keys(entry)))
+            if has_hard_conflict:
+                entry_rank = priority_order.get(entry_key)
+                if entry_rank is not None and entry_rank < active_rank:
+                    conflict_color = tree_conflict_row_color(self._tree, mo2_conflict_green(), 0.34)
+                else:
+                    conflict_color = tree_conflict_row_color(self._tree, mo2_conflict_red(), 0.34)
+                conflict_brushes[entry_key] = QBrush(conflict_color)
+                overview_colors[entry_key] = conflict_color
+            elif has_info_conflict:
+                conflict_color = tree_conflict_row_color(self._tree, mo2_archive_conflict_purple(), 0.34)
                 conflict_brushes[entry_key] = QBrush(conflict_color)
                 overview_colors[entry_key] = conflict_color
         return conflict_brushes, overview_colors
 
-    # Rebuild the visible patch tree from the entry list.
+
     def _rebuild_tree_from_entries(self):
         conflict_brushes, overview_colors = self._build_conflict_styles(self._entries)
+        patch_conflict_states = self._build_patch_conflict_states(self._entries)
 
         self._tree.blockSignals(True)
         self._tree.clear()
         for entry in self._entries:
-            item = _PatcherItem(["", entry.mod_name, entry.patch_name, entry.description, str(entry.priority)])
+            item = _PatcherItem(["", "", entry.mod_name, entry.patch_name, entry.description, str(entry.priority)])
+            for col in range(PATCHER_TREE_COLUMN_COUNT):
+                item.setSizeHint(col, self._patcher_row_size)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(0, Qt.CheckState.Checked if entry.enabled else Qt.CheckState.Unchecked)
-            item.setData(4, Qt.ItemDataRole.UserRole, entry.priority)
-            item.setData(0, Qt.ItemDataRole.UserRole, entry.ini_short_path)
-            item.setData(0, Qt.ItemDataRole.UserRole + 1, entry.destination)
-            item.setData(0, Qt.ItemDataRole.UserRole + 2, entry.install_paths)
-            item.setData(0, Qt.ItemDataRole.UserRole + 3, entry.required)
-            item.setData(0, Qt.ItemDataRole.UserRole + 4, entry.files)
-            item.setData(0, Qt.ItemDataRole.UserRole + 5, self._conflict_key_string(entry.operations))
-            item.setToolTip(3, entry.description)
-            item.setToolTip(3, entry.description if not entry.files else f"{entry.description}\n\nFiles: {entry.files}")
+            item.setCheckState(COL_ENABLED, Qt.CheckState.Checked if entry.enabled else Qt.CheckState.Unchecked)
+            item.setData(COL_PRIORITY, Qt.ItemDataRole.UserRole, entry.priority)
+            item.setData(COL_ENABLED, ROLE_INI_PATH, entry.ini_short_path)
+            item.setData(COL_ENABLED, ROLE_DESTINATION, entry.destination)
+            item.setData(COL_ENABLED, ROLE_INSTALL_PATHS, entry.install_paths)
+            item.setData(COL_ENABLED, ROLE_REQUIRED, entry.required)
+            item.setData(COL_ENABLED, ROLE_FILES, entry.files)
+            item.setToolTip(COL_DESCRIPTION, entry.description)
+            item.setToolTip(
+                COL_DESCRIPTION,
+                entry.description if not entry.files else f"{entry.description}\n\nFiles: {entry.files}",
+            )
             item_key = f"{entry.mod_name}::{entry.patch_name}"
+            conflict_state = patch_conflict_states.get(item_key)
+            if conflict_state:
+                state, tooltip = conflict_state
+                item.setIcon(COL_CONFLICTS, self._patch_conflict_icon(state))
+                item.setToolTip(COL_CONFLICTS, tooltip)
+                item.setData(COL_CONFLICTS, ROLE_CONFLICT_SORT, self._patch_conflict_sort_weight(state))
+            else:
+                item.setData(COL_CONFLICTS, ROLE_CONFLICT_SORT, 0)
             brush = conflict_brushes.get(item_key)
             overview_color = overview_colors.get(item_key)
-            item.setData(0, Qt.ItemDataRole.UserRole + 6, overview_color.name() if overview_color else "")
+            item.setData(COL_ENABLED, ROLE_OVERVIEW_COLOR, overview_color.name() if overview_color else "")
             if brush is not None:
-                for col in range(5):
+                for col in range(PATCHER_TREE_COLUMN_COUNT):
                     item.setBackground(col, brush)
             self._tree.addTopLevelItem(item)
         self._tree.blockSignals(False)
         self._tree.sortItems(self._tree.sortColumn(), self._tree.header().sortIndicatorOrder())
+        self._restore_active_selection()
         self._update_conflict_overview()
 
-    # Persist the current patch tree state to JSON.
+
+    def _restore_active_selection(self):
+        if not self._active_conflict_key:
+            return
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            if self._entry_key(item) == self._active_conflict_key:
+                self._tree.setCurrentItem(item)
+                return
+
+
     def _write_json(self):
         payload = {"patches": []}
         for i in range(self._tree.topLevelItemCount()):
             item = self._tree.topLevelItem(i)
             payload["patches"].append({
-                "enabled": item.checkState(0) == Qt.CheckState.Checked,
-                "priority": int(item.text(4)) if item.text(4).isdigit() else -1,
-                "mod_name": item.text(1),
-                "patch_name": item.text(2),
-                "description": item.text(3),
-                "ini_short_path": item.data(0, Qt.ItemDataRole.UserRole) or "",
-                "destination": item.data(0, Qt.ItemDataRole.UserRole + 1) or "",
-                "install_paths": item.data(0, Qt.ItemDataRole.UserRole + 2) or "",
-                "files": item.data(0, Qt.ItemDataRole.UserRole + 4) or "",
-                "required": item.data(0, Qt.ItemDataRole.UserRole + 3) or "",
+                "enabled": item.checkState(COL_ENABLED) == Qt.CheckState.Checked,
+                "priority": int(item.text(COL_PRIORITY)) if item.text(COL_PRIORITY).isdigit() else -1,
+                "mod_name": item.text(COL_MOD),
+                "patch_name": item.text(COL_PATCH),
+                "description": item.text(COL_DESCRIPTION),
+                "ini_short_path": item.data(COL_ENABLED, ROLE_INI_PATH) or "",
+                "destination": item.data(COL_ENABLED, ROLE_DESTINATION) or "",
+                "install_paths": item.data(COL_ENABLED, ROLE_INSTALL_PATHS) or "",
+                "files": item.data(COL_ENABLED, ROLE_FILES) or "",
+                "required": item.data(COL_ENABLED, ROLE_REQUIRED) or "",
             })
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    # Queue or trigger a patch list refresh.
+
     def schedule_refresh(self, immediate: bool = False):
         self._refresh_pending = True
         if not self.isVisible() and not immediate:
             return
         self._refresh_timer.start(0 if immediate else self._refresh_timer.interval())
 
-    # Preserve the public refresh entry point for explicit callers.
+
     def refresh(self):
         self.schedule_refresh(immediate=True)
 
-    # Refresh patch entries and run them after sync.
+
     def run_after_sync(self):
         self._open_runner_dialog()
         self._refresh_pending = False
@@ -1634,7 +1635,7 @@ class Kotor2PatcherTab(QWidget):
         self._write_json()
         self._run_patcher()
 
-    # Reload entries and refresh the patch tree.
+
     def _refresh_now(self):
         if not self.isVisible() and self._tree.topLevelItemCount():
             return
@@ -1645,42 +1646,35 @@ class Kotor2PatcherTab(QWidget):
         self._update_summary()
         self._write_json()
 
-    # Enable or disable every visible row.
-    def _set_all_enabled(self, enabled: bool):
-        self._tree.blockSignals(True)
-        state = Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
-        for i in range(self._tree.topLevelItemCount()):
-            self._tree.topLevelItem(i).setCheckState(0, state)
-        self._tree.blockSignals(False)
-        self._update_summary()
-        self._write_json()
 
-    # Refresh the summary label text.
     def _update_summary(self):
         total = self._tree.topLevelItemCount()
-        enabled = sum(1 for i in range(total) if self._tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked)
+        enabled = sum(
+            1 for i in range(total) if self._tree.topLevelItem(i).checkState(COL_ENABLED) == Qt.CheckState.Checked
+        )
         self._summary_label.setText(f"{enabled}/{total} patches enabled")
-    # Queue a state write after a checkbox change.
+
     def _on_item_changed(self, _item: QTreeWidgetItem, _column: int):
         self._update_summary()
         self._pending_checkbox_sync = True
         self._checkbox_sync_timer.start()
 
-    # Flush pending checkbox changes to disk and memory.
+
     def _flush_item_changes(self):
         if not self._pending_checkbox_sync:
             return
         self._pending_checkbox_sync = False
         self._write_json()
         enabled_by_key = {
-            self._entry_key(self._tree.topLevelItem(i)): self._tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked
+            self._entry_key(self._tree.topLevelItem(i)): self._tree.topLevelItem(i).checkState(COL_ENABLED)
+            == Qt.CheckState.Checked
             for i in range(self._tree.topLevelItemCount())
         }
         for entry in self._entries:
             entry.enabled = enabled_by_key.get(f"{entry.mod_name}::{entry.patch_name}", entry.enabled)
         self._rebuild_tree_from_entries()
 
-    # Apply the delayed row click selection.
+
     def _flush_pending_click(self):
         if not self._pending_click_entry_key:
             return
@@ -1688,20 +1682,28 @@ class Kotor2PatcherTab(QWidget):
         self._pending_click_entry_key = None
         self._rebuild_tree_from_entries()
 
-    # Queue a conflict selection when a row is clicked.
+
     def _on_item_clicked(self, item: QTreeWidgetItem, _column: int):
-        if _column == 0:
+        if _column == COL_ENABLED:
             return
+        self._highlight_mo2_mod(item.text(COL_MOD))
         self._pending_click_entry_key = self._entry_key(item)
         self._click_select_timer.start()
 
-    # Open the patch details dialog for a row.
+
+    def _on_current_item_changed(self, item: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None):
+        if item is None:
+            return
+        self._highlight_mo2_mod(item.text(COL_MOD))
+
+
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
         self._click_select_timer.stop()
         self._pending_click_entry_key = None
+        self._highlight_mo2_mod(item.text(COL_MOD))
         self._show_item_information(item)
 
-    # Show the row context menu for the patcher list.
+
     def _on_tree_context_menu(self, pos: QPoint):
         item = self._tree.itemAt(pos)
         if item is None:
@@ -1727,7 +1729,7 @@ class Kotor2PatcherTab(QWidget):
             if folder_path is not None:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder_path)))
 
-    # Open the patch details dialog for a row.
+
     def _show_item_information(self, item: QTreeWidgetItem):
         entry_key = self._entry_key(item)
         entry = next(
@@ -1745,4 +1747,3 @@ class Kotor2PatcherTab(QWidget):
         conflict_rows = self._selected_conflict_rows(item)
         dialog = _PatcherDetailsDialog(self, self, entry, conflict_rows, info_text, info_path, ini_text, log_text)
         dialog.exec()
-

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import mobase
 from PyQt6.QtCore import QDateTime, QPoint, Qt, QTimer, QUrl
-from PyQt6.QtGui import QBrush, QDesktopServices
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -19,17 +19,20 @@ from PyQt6.QtWidgets import (
 from ui_theme import (
     configure_refresh_button,
     configure_tree_widget,
+    mo2_archive_conflict_purple,
     set_header_resize_mode,
+    tree_conflict_row_color,
     tree_major_conflict_color,
     tree_minor_conflict_color,
+    tree_row_padding_stylesheet,
 )
 
 logger = logging.getLogger("mobase")
 
 
-# Sort texture rows by the custom error and priority columns.
+
 class _TextureItem(QTreeWidgetItem):
-    # Compare rows using the active sort column.
+
     def __lt__(self, other: "QTreeWidgetItem") -> bool:
         tree = self.treeWidget()
         if tree:
@@ -82,7 +85,7 @@ class _TextureItem(QTreeWidgetItem):
         return super().__lt__(other)
 
 
-# Render the texture conflict browser tab.
+
 class Kotor2TextureTab(QWidget):
     _EXTENSIONS = {".tga", ".tpc", ".txi", ".dds"}
     _WEIGHT_NONE = 0
@@ -90,7 +93,7 @@ class Kotor2TextureTab(QWidget):
     _WEIGHT_MINOR = 2
     _WEIGHT_MAJOR = 3
 
-    # Build the textures tab UI and refresh hooks.
+
     def __init__(self, parent: QWidget | None, organizer: mobase.IOrganizer, game):
         super().__init__(parent)
         self._organizer = organizer
@@ -109,7 +112,7 @@ class Kotor2TextureTab(QWidget):
         refresh_btn.clicked.connect(self.refresh)
         auto_fix_btn = QPushButton("Auto Fix")
         auto_fix_btn.clicked.connect(self._auto_fix)
-        unhide_btn = QPushButton("Unhide all")
+        unhide_btn = QPushButton("Undo All")
         unhide_btn.clicked.connect(self._unhide_all)
         header.addWidget(refresh_btn)
         header.addWidget(self._count_label)
@@ -134,6 +137,7 @@ class Kotor2TextureTab(QWidget):
             self._tree,
             selection_mode=QAbstractItemView.SelectionMode.ExtendedSelection,
         )
+        self._tree.setStyleSheet(tree_row_padding_stylesheet())
         self._tree.itemDoubleClicked.connect(self._open_item)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._context_menu)
@@ -148,28 +152,32 @@ class Kotor2TextureTab(QWidget):
         organizer.modList().onModStateChanged(lambda mods: self.schedule_refresh())
         self.schedule_refresh()
 
-    # Return the major conflict highlight brush.
+
     def _major_conflict_brush(self) -> QBrush:
         return QBrush(tree_major_conflict_color(self._tree))
 
-    # Return the minor conflict highlight brush.
+
     def _minor_conflict_brush(self) -> QBrush:
         return QBrush(tree_minor_conflict_color(self._tree))
 
-    # Refresh immediately when the tab becomes visible.
+
+    def _related_texture_brush(self) -> QBrush:
+        return QBrush(tree_conflict_row_color(self._tree, mo2_archive_conflict_purple(), 0.34))
+
+
     def showEvent(self, event):
         super().showEvent(event)
         if self._refresh_pending or not self._tree.topLevelItemCount():
             self.schedule_refresh(immediate=True)
 
-    # Queue or trigger a tab refresh.
+
     def schedule_refresh(self, immediate: bool = False):
         self._refresh_pending = True
         if not self.isVisible() and not immediate:
             return
         self._refresh_timer.start(0 if immediate else self._refresh_timer.interval())
 
-    # Yield active override roots in winner-resolution order.
+
     def _iter_override_roots(self):
         for mod_path in self._game._active_mod_paths():
             for candidate in (mod_path / "override", mod_path / "Override"):
@@ -180,7 +188,7 @@ class Kotor2TextureTab(QWidget):
         if override_path.exists():
             yield "Game Override", override_path
 
-    # Yield override roots in winning priority order.
+
     def _iter_winner_override_roots(self):
         mod_entries: list[tuple[str, Path]] = []
         game_entry: tuple[str, Path] | None = None
@@ -193,17 +201,77 @@ class Kotor2TextureTab(QWidget):
         if game_entry:
             yield game_entry
 
-    # Force an immediate refresh pass.
+
     def refresh(self):
         self.schedule_refresh(immediate=True)
 
-    # Refresh, auto-fix, and refresh again after sync.
+
+    def major_error_count(self) -> int:
+        return self.count_major_errors_for_game(self._game)
+
+
+    @classmethod
+    def count_major_errors_for_game(cls, game) -> int:
+        winners: dict[str, tuple[str, str]] = {}
+        mod_entries: list[tuple[str, Path]] = []
+        game_entry: tuple[str, Path] | None = None
+        for source, root in cls._iter_override_roots_for_game(game):
+            if source.startswith("Mod: "):
+                mod_entries.append((source, root))
+            else:
+                game_entry = (source, root)
+
+        for source, root in reversed(mod_entries):
+            cls._scan_root_for_winners(source, root, winners)
+        if game_entry:
+            cls._scan_root_for_winners(game_entry[0], game_entry[1], winners)
+
+        base_exts: dict[str, set[str]] = {}
+        base_counts: dict[str, int] = {}
+        for _source, rel in winners.values():
+            base_key = Path(rel).with_suffix("").as_posix().lower()
+            ext_lower = Path(rel).suffix.lower().lstrip(".")
+            base_exts.setdefault(base_key, set()).add(ext_lower)
+            base_counts[base_key] = base_counts.get(base_key, 0) + 1
+
+        return sum(
+            base_counts.get(base, 0)
+            for base, exts in base_exts.items()
+            if "tpc" in exts and "txi" in exts
+        )
+
+
+    @staticmethod
+    def _iter_override_roots_for_game(game):
+        for mod_path in game._active_mod_paths():
+            for candidate in (mod_path / "override", mod_path / "Override"):
+                if candidate.exists() and candidate.is_dir():
+                    yield f"Mod: {mod_path.name}", candidate
+                    break
+        override_path = Path(game.overrideDirectory().absolutePath())
+        if override_path.exists():
+            yield "Game Override", override_path
+
+
+    @classmethod
+    def _scan_root_for_winners(cls, source: str, root: Path, winners: dict[str, tuple[str, str]]):
+        for file in root.rglob("*"):
+            if not file.is_file() or file.name.endswith(".mohidden"):
+                continue
+            if file.suffix.lower() not in cls._EXTENSIONS:
+                continue
+            rel = file.relative_to(root).as_posix()
+            key = rel.lower()
+            if key not in winners:
+                winners[key] = (source, rel)
+
+
     def run_auto_fix_after_sync(self):
         self._refresh_now(force=True)
         self._auto_fix()
         self._refresh_now(force=True)
 
-    # Unhide every hidden texture, then refresh and auto-fix after sync.
+
     def run_unhide_all_and_auto_fix_after_sync(self):
         self._refresh_now(force=True)
         self._unhide_all()
@@ -211,13 +279,13 @@ class Kotor2TextureTab(QWidget):
         self._auto_fix()
         self._refresh_now(force=True)
 
-    # Unhide every hidden texture before building a KSON.
+
     def run_unhide_all_for_build(self):
         self._refresh_now(force=True)
         self._unhide_all()
         self._refresh_now(force=True)
 
-    # Scan override roots and rebuild the texture table.
+
     def _refresh_now(self, force: bool = False):
         if not force and not self.isVisible():
             return
@@ -353,7 +421,7 @@ class Kotor2TextureTab(QWidget):
             f"{len(items) + hidden_count} texture files | Major: {major_errors} | Minor: {minor_errors} | Hidden: {hidden_count}"
         )
 
-    # Record winning visible files and hidden entries from one root.
+
     def _scan_root(self, source: str, root: Path, winners: dict[str, tuple[str, str]], hidden_entries: list[tuple[str, str]]):
         for file in root.rglob("*"):
             if not file.is_file():
@@ -369,40 +437,50 @@ class Kotor2TextureTab(QWidget):
             elif key not in winners:
                 winners[key] = (source, rel)
 
-    # Resolve the source path stored on a row.
+
     def _item_path(self, item: QTreeWidgetItem) -> Path | None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         return Path(str(data)) if data else None
 
-    # Open the clicked texture file externally.
+
     def _open_item(self, item: QTreeWidgetItem, _column: int):
         path = self._item_path(item)
         if path and path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
-    # Select all rows that share the same normalized texture base.
+
     def _sync_base_selection(self):
         if self._syncing_selection:
             return
         selected_items = self._tree.selectedItems()
-        if not selected_items:
-            return
 
         selected_bases = {
             item.data(0, Qt.ItemDataRole.UserRole + 4)
             for item in selected_items
             if item.data(0, Qt.ItemDataRole.UserRole + 4)
         }
+        selected_item_ids = {id(item) for item in selected_items}
+        related_brush = self._related_texture_brush()
         self._syncing_selection = True
         try:
             for i in range(self._tree.topLevelItemCount()):
                 item = self._tree.topLevelItem(i)
                 item_base = item.data(0, Qt.ItemDataRole.UserRole + 4)
-                item.setSelected(bool(item_base and item_base in selected_bases))
+                is_related = bool(item_base and item_base in selected_bases and id(item) not in selected_item_ids)
+                brush = related_brush if is_related else self._stored_row_brush(item)
+                for col in range(7):
+                    item.setBackground(col, brush)
         finally:
             self._syncing_selection = False
 
-    # Show the hide/unhide context menu for a row.
+
+    def _stored_row_brush(self, item: QTreeWidgetItem) -> QBrush:
+        color_name = item.data(0, Qt.ItemDataRole.UserRole + 3)
+        if color_name:
+            return QBrush(QColor(str(color_name)))
+        return QBrush()
+
+
     def _context_menu(self, pos: QPoint):
         item = self._tree.itemAt(pos)
         if not item:
@@ -425,7 +503,7 @@ class Kotor2TextureTab(QWidget):
         elif chosen_action is toggle_action:
             self._toggle_hidden(path, is_hidden)
 
-    # Toggle the .mohidden suffix for a texture file.
+
     def _toggle_hidden(self, path: Path, currently_hidden: bool):
         try:
             if currently_hidden and path.name.endswith(".mohidden"):
@@ -440,7 +518,7 @@ class Kotor2TextureTab(QWidget):
         finally:
             self.refresh()
 
-    # Build visible texture files by base and extension in winner order.
+
     def _visible_files_by_base(self) -> dict[str, dict[str, list[Path]]]:
         visible_by_base: dict[str, dict[str, list[Path]]] = {}
 
@@ -457,7 +535,7 @@ class Kotor2TextureTab(QWidget):
 
         return visible_by_base
 
-    # Hide lower-priority visible texture variants for each texture base.
+
     def _auto_fix(self):
         while True:
             visible_by_base = self._visible_files_by_base()
@@ -490,7 +568,7 @@ class Kotor2TextureTab(QWidget):
 
         self.refresh()
 
-    # Unhide every hidden texture in the active mod stack.
+
     def _unhide_all(self):
         paths: list[Path] = []
         for i in range(self._tree.topLevelItemCount()):
@@ -505,8 +583,8 @@ class Kotor2TextureTab(QWidget):
                 logger.warning(f"[KOTOR2] Failed to unhide {path}: {e}")
         self.refresh()
 
-    # Return the visible extension set to keep for one texture base.
-    # Choose the visible texture extensions.
+
+
     @staticmethod
     def _winner_extensions(files: dict[str, Path]) -> set[str]:
         if not files:
@@ -523,8 +601,8 @@ class Kotor2TextureTab(QWidget):
             return {".txi"}
         return set()
 
-    # Format a byte count for display.
-    # Format a byte size.
+
+
     @staticmethod
     def _format_size(size: int) -> str:
         units = ["B", "KB", "MB", "GB"]

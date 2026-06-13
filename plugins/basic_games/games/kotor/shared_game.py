@@ -12,7 +12,7 @@ from sync_tab import Kotor2SyncTab
 from texture_tab import Kotor2TextureTab
 
 
-# Share common KOTOR game behavior.
+
 class KotorGameMixin:
     _logger = None
     _log_prefix = "KOTOR"
@@ -20,7 +20,7 @@ class KotorGameMixin:
     _workshop_game_name = "KOTOR"
     _workshop_warning_text = ""
 
-    # Return game folders managed by MO2.
+
     def game_directories(self) -> list[QDir]:
         return [
             self.dataDirectory(),
@@ -35,47 +35,47 @@ class KotorGameMixin:
             self.savesDirectory(),
         ]
 
-    # Return the Data folder.
+
     def dataDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/Data")
 
-    # Return the Lips folder.
+
     def lipsDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/Lips")
 
-    # Return the Modules folder.
+
     def modulesDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/Modules")
 
-    # Return the Movies folder.
+
     def moviesDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/Movies")
 
-    # Return the Override folder.
+
     def overrideDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/Override")
 
-    # Return the StreamMusic folder.
+
     def streamMusicDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/StreamMusic")
 
-    # Return the StreamSounds folder.
+
     def streamSoundsDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/StreamSounds")
 
-    # Return the StreamVoice folder.
+
     def streamVoiceDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/StreamVoice")
 
-    # Return the TexturePacks folder.
+
     def texturePacksDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/TexturePacks")
 
-    # Return the saves folder.
+
     def savesDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/saves")
 
-    # Return MO2 mod folder mappings.
+
     def getModMappings(self) -> dict[str, list[str]]:
         return {
             "Data": [self.dataDirectory().absolutePath()],
@@ -89,7 +89,7 @@ class KotorGameMixin:
             "TexturePacks": [self.texturePacksDirectory().absolutePath()],
         }
 
-    # Yield active mod paths.
+
     def _active_mod_paths(self):
         mods_root = Path(self._organizer.modsPath())
         modlist = self._organizer.modList().allModsByProfilePriority()
@@ -98,7 +98,7 @@ class KotorGameMixin:
             if self._organizer.modList().state(mod_name) & mobase.ModState.ACTIVE:
                 yield mods_root / mod_name
 
-    # Map active dialog.tlk files.
+
     def mappings(self) -> list[mobase.Mapping]:
         mappings = []
         game_path = Path(self.gameDirectory().absolutePath())
@@ -120,7 +120,12 @@ class KotorGameMixin:
 
         return mappings
 
-    # Log platform details once.
+
+    def _before_run(self, _app) -> bool:
+        self._log_platform_once()
+        return self._confirm_texture_major_errors()
+
+
     def _log_platform_once(self, force: bool = False) -> bool:
         if self._platform_logged and not force:
             return True
@@ -140,7 +145,7 @@ class KotorGameMixin:
             self._logger.info("[%s] Platform logging failed: %s", self._log_prefix, exc)
         return True
 
-    # Detect the Steam root folder.
+
     def _detect_steam_root(self, game_path: Path) -> str:
         try:
             parts = [part.lower() for part in game_path.parts]
@@ -168,7 +173,7 @@ class KotorGameMixin:
 
         return "unknown"
 
-    # Warn when Steam Workshop content exists.
+
     def _warn_if_workshop_present(self, steam_root: str):
         if steam_root.lower() == "unknown":
             return
@@ -191,7 +196,41 @@ class KotorGameMixin:
         except Exception as exc:
             self._logger.debug("[%s] Workshop check failed: %s", self._log_prefix, exc)
 
-    # Add custom tabs to MO2.
+
+    def _confirm_texture_major_errors(self) -> bool:
+        try:
+            if self._texture_tab is not None:
+                major_errors = self._texture_tab.major_error_count()
+            else:
+                major_errors = Kotor2TextureTab.count_major_errors_for_game(self)
+        except Exception as exc:
+            self._logger.info("[%s] Texture warning check failed: %s", self._log_prefix, exc)
+            return True
+
+        if major_errors <= 0:
+            return True
+
+        self._logger.warning("[%s] Major texture conflicts detected: %s", self._log_prefix, major_errors)
+        try:
+            result = QMessageBox.warning(
+                None,
+                self._workshop_game_name,
+                (
+                    f"{major_errors} major texture conflict(s) are active.\n\n"
+                    "Major texture conflicts usually mean a visible TPC texture and TXI file share the same base name. "
+                    "These conflicts can cause the game to crash. "
+                    "Review the Textures tab before launching if you want to fix them.\n\n"
+                    "Launch anyway?"
+                ),
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            return result != QMessageBox.StandardButton.Cancel
+        except Exception as exc:
+            self._logger.debug("[%s] Texture warning dialog failed: %s", self._log_prefix, exc)
+            return True
+
+
     def _init_custom_tabs_common(self, main_window: QMainWindow):
         if self._organizer.managedGame() != self:
             return

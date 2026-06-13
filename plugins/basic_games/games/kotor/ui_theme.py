@@ -5,13 +5,21 @@ from pathlib import Path
 
 from PyQt6.QtCore import QSize, QTimer
 from PyQt6.QtGui import QAction, QColor, QPalette
-from PyQt6.QtWidgets import QAbstractItemView, QHeaderView, QPushButton, QStyle, QToolButton, QTreeWidget, QWidget
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QHeaderView,
+    QPushButton,
+    QStyle,
+    QToolButton,
+    QTreeWidget,
+    QWidget,
+)
 
 
 logger = logging.getLogger("mobase")
 
 
-# Blend two colors by a fixed alpha amount.
+
 def blend_colors(base: QColor, overlay: QColor, alpha: float) -> QColor:
     alpha = max(0.0, min(1.0, alpha))
     return QColor(
@@ -21,7 +29,7 @@ def blend_colors(base: QColor, overlay: QColor, alpha: float) -> QColor:
     )
 
 
-# Decode MO2's QVariant color serialization format.
+
 def decode_qvariant_color(value: str) -> QColor | None:
     match = re.fullmatch(r"@Variant\((.*)\)", value.strip())
     if not match:
@@ -53,7 +61,7 @@ def decode_qvariant_color(value: str) -> QColor | None:
     return QColor(*(channel // 257 for channel in rgb16))
 
 
-# Read a color setting from ModOrganizer.ini.
+
 def mo2_setting_color(setting_name: str, fallback: QColor | None = None) -> QColor:
     ini_path = Path(__file__).resolve().parents[4] / "ModOrganizer.ini"
     parser = configparser.ConfigParser(interpolation=None)
@@ -70,87 +78,85 @@ def mo2_setting_color(setting_name: str, fallback: QColor | None = None) -> QCol
     return fallback if fallback is not None else QColor(255, 0, 0)
 
 
-# Return MO2's configured loose-file conflict color.
+
+def mo2_conflict_green() -> QColor:
+    return mo2_setting_color("overwrittenLooseFilesColor", QColor(0, 160, 0))
+
+
+
 def mo2_conflict_red() -> QColor:
-    return mo2_setting_color("overwritingLooseFilesColor", QColor(255, 0, 0))
+    return mo2_setting_color("overwritingLooseFilesColor", QColor(220, 0, 0))
 
 
-# Match MO2's compact refresh buttons used by built-in tabs.
+
+def mo2_archive_conflict_purple() -> QColor:
+    return mo2_setting_color("overwritingArchiveFilesColor", QColor(96, 16, 128))
+
+
+
+def mo2_mod_contains_file_color() -> QColor:
+    return mo2_setting_color("modlistContainsFileColor", QColor(0, 0, 255, 64))
+
+
+
 def configure_refresh_button(button: QPushButton) -> None:
     button.setText("Refresh")
     button.setIcon(button.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
     button.setIconSize(QSize(16, 16))
 
 
-# Match MO2's compact download-style buttons.
+
 def configure_download_button(button: QPushButton) -> None:
     button.setIcon(button.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
     button.setIconSize(QSize(16, 16))
 
 
-# Return the tree base background color.
+
 def tree_base_color(tree: QTreeWidget) -> QColor:
     return tree.palette().color(QPalette.ColorRole.Base)
 
 
-# Return the tree alternate-row background color.
+
 def tree_alt_base_color(tree: QTreeWidget) -> QColor:
     return tree.palette().color(QPalette.ColorRole.AlternateBase)
 
 
-# Return the tree selection highlight color.
+
 def tree_highlight_color(tree: QTreeWidget) -> QColor:
     return tree.palette().color(QPalette.ColorRole.Highlight)
 
 
-# Return the tree text color.
-def tree_text_color(tree: QTreeWidget) -> QColor:
-    return tree.palette().color(QPalette.ColorRole.Text)
 
-
-# Build the hover color used for tree rows.
 def tree_hover_color(tree: QTreeWidget, alpha: float = 0.34) -> QColor:
     return blend_colors(tree_alt_base_color(tree), tree_highlight_color(tree), alpha)
 
 
-# Build the shared conflict-row background color.
+
 def tree_conflict_row_color(tree: QTreeWidget, conflict_color: QColor, alpha: float = 0.24) -> QColor:
     return blend_colors(tree_base_color(tree), conflict_color, alpha)
 
 
-# Build the active conflict-row background color.
-def tree_active_conflict_row_color(
-    tree: QTreeWidget, conflict_color: QColor, alpha: float = 0.22
-) -> QColor:
-    return blend_colors(tree_base_color(tree), tree_highlight_color(tree), alpha)
 
-
-# Return the marker color used for selected rows.
 def tree_selected_marker_color(tree: QTreeWidget) -> QColor:
     return tree_highlight_color(tree)
 
 
-# Build the major conflict brush color used by texture-like views.
+
 def tree_major_conflict_color(tree: QTreeWidget, conflict_color: QColor | None = None, alpha: float = 0.34) -> QColor:
     return blend_colors(tree_alt_base_color(tree), conflict_color or mo2_conflict_red(), alpha)
 
 
-# Build the minor conflict brush color used by texture-like views.
+
 def tree_minor_conflict_color(tree: QTreeWidget, conflict_color: QColor | None = None, alpha: float = 0.20) -> QColor:
     return blend_colors(tree_base_color(tree), conflict_color or mo2_conflict_red(), alpha)
 
 
-# Build a shared hover stylesheet for tree widgets.
-def tree_hover_stylesheet(tree: QTreeWidget, alpha: float = 0.34) -> str:
-    hover = tree_hover_color(tree, alpha)
-    return (
-        "QTreeWidget::item:hover {"
-        f" background-color: rgba({hover.red()}, {hover.green()}, {hover.blue()}, 160);"
-        "}"
-    )
+
+def tree_row_padding_stylesheet() -> str:
+    return "QTreeWidget::item { padding: 0.3em 0; }"
 
 
-# Apply the common base configuration for tree widgets.
+
 def configure_tree_widget(
     tree: QTreeWidget,
     *,
@@ -169,18 +175,18 @@ def configure_tree_widget(
     tree.setMouseTracking(mouse_tracking)
 
 
-# Apply one resize mode to every header section.
+
 def set_header_resize_mode(header: QHeaderView, mode: QHeaderView.ResizeMode, count: int) -> None:
     for col in range(count):
         header.setSectionResizeMode(col, mode)
 
 
-# Trigger MO2's refresh after the current UI task finishes.
+
 def refresh_mo2(organizer, widget: QWidget | None = None) -> None:
     QTimer.singleShot(250, lambda: _refresh_mo2_now(organizer, widget))
 
 
-# Run the actual MO2 refresh attempt.
+
 def _refresh_mo2_now(organizer, widget: QWidget | None = None) -> bool:
     refresh = getattr(organizer, "refresh", None)
     if callable(refresh):

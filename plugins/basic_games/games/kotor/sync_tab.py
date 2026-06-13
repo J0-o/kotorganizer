@@ -8,16 +8,13 @@ import re
 import subprocess
 import tempfile
 import time
-import zipfile
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 import mobase
-from PyQt6.QtCore import QObject, QPoint, QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, QProcess, Qt, QThread, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +23,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTreeWidget,
@@ -36,8 +34,22 @@ from PyQt6.QtWidgets import (
 
 from archive_service import ArchiveService
 from hash_utils import file_hash
-from sync_installer import SyncInstallResult, install_kson_build
-from ui_theme import configure_download_button, configure_refresh_button, configure_tree_widget, refresh_mo2, set_header_resize_mode
+from sync_installer import SyncInstallResult
+from sync_workers import (
+    _DownloadedValidationWorker,
+    _FetchWorker,
+    _SyncWorker,
+    _ValidationWorker,
+    _kson_version_text_from_name,
+)
+from ui_theme import (
+    configure_download_button,
+    configure_refresh_button,
+    configure_tree_widget,
+    refresh_mo2,
+    set_header_resize_mode,
+    tree_row_padding_stylesheet,
+)
 
 logger = logging.getLogger("mobase")
 
@@ -45,156 +57,20 @@ logger = logging.getLogger("mobase")
 _WM_CLOSE = 0x0010
 
 
-# Convert a KSON filename timestamp to display text.
-def _kson_version_text_from_name(name: str) -> str:
-    match = re.search(r"(\d{8})[_-]?(\d{6})", Path(name).stem)
-    if not match:
-        return "unknown"
-    try:
-        parsed = datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")
-        return parsed.strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return "unknown"
+def _log_info(message: str):
+    logger.info(f"[KOTOR2 Sync] {message}")
 
 
-# Fetch KSON data off the UI thread.
-class _FetchWorker(QObject):
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str, object)
+def _log_warning(message: str):
+    cleaned = " ".join(str(message).split())
+    if len(cleaned) > 500:
+        cleaned = f"{cleaned[:497]}..."
+    logger.warning(f"[KOTOR2 Sync] {cleaned}")
 
-    # Store fetch inputs for the worker.
-    def __init__(self, cache_path: Path, build_key: str, game_name: str, repo: str, timeout: int):
-        super().__init__()
-        self._cache_path = cache_path
-        self._build_key = build_key
-        self._game_name = game_name
-        self._repo = repo
-        self._timeout = timeout
 
-    # Fetch, cache, and select KSON data.
-    def run(self):
-        errors: list[str] = []
-        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            remote_kson, _source_url, remote_name = self._download_kson()
-            remote_path = self._cache_path.parent / remote_name
-            remote_path.write_text(json.dumps(remote_kson, indent=2), encoding="utf-8")
-        except Exception as exc:
-            errors.append(str(exc))
 
-        try:
-            selected_path, kson = self._latest_local_kson()
-            kson["_selected_kson_name"] = selected_path.name
-            self._cache_path.write_text(json.dumps(kson, indent=2), encoding="utf-8")
-            mod_count = len([mod for mod in kson.get("mods", []) if Kotor2SyncTab._kson_mod_name(mod)])
-            details = [
-                f"Loaded {mod_count} mods for {kson.get('game') or self._build_key}.",
-                f"KSON version: {_kson_version_text_from_name(selected_path.name)}",
-                f"Selected KSON: {selected_path}",
-                f"Source URL: {kson.get('_source_url') or '(local file)'}",
-                f"Cache file: {self._cache_path}",
-            ]
-            if errors:
-                details.extend(["", "Fetch warnings:", *errors])
-            self.finished.emit(
-                {
-                    "selected_path": str(selected_path),
-                    "kson": kson,
-                    "mod_count": mod_count,
-                    "details": "\n".join(details),
-                    "warnings": errors,
-                }
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc), errors)
-
-    # Download the newest remote KSON.
-    def _download_kson(self) -> tuple[dict, str, str]:
-        errors: list[str] = []
-        for branch in ("main", "master"):
-            try:
-                source_url, file_name = self._latest_kson_raw_url(branch)
-                text = self._download_text(source_url)
-                kson = json.loads(text)
-                mods = kson.get("mods", [])
-                if isinstance(mods, list) and any(Kotor2SyncTab._kson_mod_name(mod) for mod in mods):
-                    kson["_source_url"] = source_url
-                    kson["_fetched_at"] = datetime.now(timezone.utc).isoformat()
-                    return kson, source_url, file_name
-                errors.append(f"{source_url} -> no mod entries found")
-            except Exception as exc:
-                errors.append(f"{self._repo}/{branch} -> {exc}")
-        raise RuntimeError("Unable to fetch a usable KSON manifest.\n\n" + "\n".join(errors))
-
-    # Return the newest raw KSON URL.
-    def _latest_kson_raw_url(self, branch: str) -> tuple[str, str]:
-        tree_url = f"https://api.github.com/repos/{self._repo}/git/trees/{branch}?recursive=1"
-        payload = json.loads(self._download_text(tree_url))
-        files = [
-            str(item.get("path", ""))
-            for item in payload.get("tree", [])
-            if item.get("type") == "blob" and self._is_game_kson_path(str(item.get("path", "")))
-        ]
-        if not files:
-            raise RuntimeError(f"No {self._build_key} .kson files found on {branch}.")
-        latest = max(files, key=self._kson_sort_key)
-        return f"https://raw.githubusercontent.com/{self._repo}/{branch}/{quote(latest)}", Path(latest).name
-
-    # Return the newest local KSON.
-    def _latest_local_kson(self) -> tuple[Path, dict]:
-        candidates = []
-        for path in self._cache_path.parent.glob("*.kson"):
-            if path.name == self._cache_path.name:
-                continue
-            if self._is_game_kson_path(path.name):
-                candidates.append(path)
-        if not candidates and self._cache_path.exists():
-            candidates.append(self._cache_path)
-        if not candidates:
-            raise RuntimeError(f"No local {self._build_key} KSON files are available.")
-
-        errors: list[str] = []
-        for path in sorted(candidates, key=lambda item: self._kson_sort_key(item.name), reverse=True):
-            try:
-                kson = json.loads(path.read_text(encoding="utf-8"))
-                mods = kson.get("mods", [])
-                if isinstance(mods, list) and any(Kotor2SyncTab._kson_mod_name(mod) for mod in mods):
-                    return path, kson
-                errors.append(f"{path.name}: no mod entries found")
-            except Exception as exc:
-                errors.append(f"{path.name}: {exc}")
-        raise RuntimeError("No usable local KSON files are available.\n\n" + "\n".join(errors))
-
-    # Download one text payload.
-    def _download_text(self, url: str) -> str:
-        request = Request(url, headers={"User-Agent": "KOTORganizer-MO2-SyncTab/1.0"})
-        try:
-            with urlopen(request, timeout=self._timeout) as response:
-                charset = response.headers.get_content_charset() or "utf-8"
-                return response.read().decode(charset, errors="replace")
-        except URLError as exc:
-            raise RuntimeError(str(exc)) from exc
-
-    # Check if a path is for this game.
-    def _is_game_kson_path(self, path: str) -> bool:
-        name = Path(path).name.lower()
-        if not name.endswith(".kson"):
-            return False
-        if self._build_key == "kotor2":
-            return name.startswith("kotor2")
-        return name.startswith("kotor") and not name.startswith("kotor2")
-
-    # Sort KSON paths by timestamp.
-    @staticmethod
-    def _kson_sort_key(path: str) -> tuple[str, str]:
-        name = Path(path).stem.lower()
-        match = re.search(r"(\d{8}[_-]?\d{6})", name)
-        timestamp = match.group(1).replace("_", "").replace("-", "") if match else ""
-        return timestamp, name
-
-# Sort rows by numeric values when present.
 class _NumericTreeWidgetItem(QTreeWidgetItem):
-    # Compare rows using stored numeric values.
+
     def __lt__(self, other):
         column = self.treeWidget().sortColumn() if self.treeWidget() else 0
         left = self.data(column, Qt.ItemDataRole.UserRole + 10)
@@ -204,98 +80,12 @@ class _NumericTreeWidgetItem(QTreeWidgetItem):
         return super().__lt__(other)
 
 
-# Run sync work off the UI thread.
-class _SyncWorker(QObject):
-    progress = pyqtSignal(int, int, str, str)
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-
-    # Store sync paths for the worker.
-    def __init__(self, kson_path: Path, downloads_path: Path, mods_path: Path, profile_path: Path):
-        super().__init__()
-        self._kson_path = kson_path
-        self._downloads_path = downloads_path
-        self._mods_path = mods_path
-        self._profile_path = profile_path
-
-    # Run the sync install.
-    def run(self):
-        try:
-            result = install_kson_build(
-                self._kson_path,
-                self._downloads_path,
-                self._mods_path,
-                self._profile_path,
-                progress=self.progress.emit,
-            )
-            self.finished.emit(result)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
-class _ValidationWorker(QObject):
-    progress = pyqtSignal(int, int, int, object)
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-
-    # Store validation inputs for the worker.
-    def __init__(self, cache_path: Path, downloads_path: Path, kson: dict, row_specs: list[dict]):
-        super().__init__()
-        self._cache_path = cache_path
-        self._downloads_path = downloads_path
-        self._kson = kson
-        self._row_specs = row_specs
-
-    # Validate archives without blocking the UI thread.
-    def run(self):
-        try:
-            runner = ArchiveService(self._downloads_path, self._cache_path)
-            runner.prepare_tslrcm_archives_for_validation(self._kson)
-
-            mods_by_name: dict[str, list[dict]] = {}
-            for mod in self._kson.get("mods", []):
-                if not isinstance(mod, dict):
-                    continue
-                mod_name = runner.kson_mod_name(mod)
-                if mod_name:
-                    mods_by_name.setdefault(mod_name, []).append(mod)
-
-            hash_cache: dict[Path, str] = {}
-            counts = {"ok": 0, "empty": 0, "missing": 0, "mismatch": 0, "skipped": 0}
-            total = len(self._row_specs)
-
-            for current, spec in enumerate(self._row_specs, start=1):
-                mod = spec.get("mod")
-                if not isinstance(mod, dict):
-                    matches = mods_by_name.get(str(spec.get("mod_name") or ""), [])
-                    mod = matches.pop(0) if matches else None
-                if not isinstance(mod, dict):
-                    result = runner._result(
-                        "skipped",
-                        "Skipped",
-                        str(spec.get("mod_name") or ""),
-                        "",
-                        "",
-                        None,
-                        "",
-                        "No matching KSON mod entry was found for this row.",
-                    )
-                else:
-                    result = runner.validate_mod(mod, hash_cache=hash_cache)
-                counts[str(result.get("bucket") or "skipped")] += 1
-                self.progress.emit(current, total, int(spec.get("row_index", current - 1)), result)
-
-            self.finished.emit(counts)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
-# Render the Sync tab inside MO2.
 class Kotor2SyncTab(QWidget):
     _FETCH_TIMEOUT_SECONDS = 20
+    _DOWNLOAD_QUEUE_DELAY_MS = 3000
     _KSON_REPO = "J0-o/kson_modlist"
 
-    # Build the sync tab UI scaffold.
+
     def __init__(self, parent: QWidget | None, organizer: mobase.IOrganizer, game):
         super().__init__(parent)
         self._organizer = organizer
@@ -303,6 +93,10 @@ class Kotor2SyncTab(QWidget):
         self._download_queue: list[tuple[QTreeWidgetItem, dict]] = []
         self._download_process: QProcess | None = None
         self._download_process_context: tuple[QTreeWidgetItem, dict, set[str]] | None = None
+        self._download_validation_thread: QThread | None = None
+        self._download_validation_worker: _DownloadedValidationWorker | None = None
+        self._download_validation_context: tuple[QTreeWidgetItem, dict, Path, str, bool] | None = None
+        self._download_validation_continue_pending = False
         self._download_cancel_requested = False
         self._browser_process: subprocess.Popen | None = None
         self._browser_profile_dir: Path | None = None
@@ -314,6 +108,7 @@ class Kotor2SyncTab(QWidget):
         self._validation_sorting_enabled: bool | None = None
         self._sync_thread: QThread | None = None
         self._sync_worker: _SyncWorker | None = None
+        self._sync_temp_kson_path: Path | None = None
         self._sync_progress_lines: list[str] = []
         self._sync_busy = False
         self._validated_for_sync = False
@@ -353,6 +148,7 @@ class Kotor2SyncTab(QWidget):
             selection_mode=QAbstractItemView.SelectionMode.SingleSelection,
             uniform_row_heights=True,
         )
+        self._tree.setStyleSheet(tree_row_padding_stylesheet())
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._show_context_menu)
         header_view = self._tree.header()
@@ -375,14 +171,14 @@ class Kotor2SyncTab(QWidget):
 
         self.refresh()
 
-    # Run the full sync-tab refresh flow from the single Refresh button.
+
     def _refresh_fetch_validate(self):
         if self._fetch_thread is not None or self._validation_thread is not None:
             return
         self.refresh()
         self._start_fetch_latest_manifest()
 
-    # Rebuild the sync list from the latest cached KSON.
+
     def refresh(self):
         self._tree.clear()
         self._validated_for_sync = False
@@ -422,6 +218,7 @@ class Kotor2SyncTab(QWidget):
             mod_name = self._kson_mod_name(mod)
             if not mod_name:
                 continue
+            skipped = self._kson_mod_skipped(mod) if isinstance(mod, dict) else False
             enabled_label = "Enabled" if self._kson_mod_enabled(mod) else "Disabled"
             priority = mod.get("priority") if isinstance(mod, dict) else None
             mod_url = str(mod.get("url") or "").strip() if isinstance(mod, dict) else ""
@@ -429,7 +226,7 @@ class Kotor2SyncTab(QWidget):
             actions = mod.get("actions", []) if isinstance(mod, dict) else []
             row = _NumericTreeWidgetItem(
                 [
-                    "Ready",
+                    "Skip" if skipped else "Ready",
                     str(priority if priority is not None else ""),
                     mod_name,
                     enabled_label,
@@ -443,6 +240,8 @@ class Kotor2SyncTab(QWidget):
             )
             row.setToolTip(7, mod_url)
             row.setData(0, Qt.ItemDataRole.UserRole + 1, mod)
+            row.setData(0, Qt.ItemDataRole.UserRole + 2, skipped)
+            row.setData(0, Qt.ItemDataRole.UserRole + 3, "")
             row.setData(1, Qt.ItemDataRole.UserRole + 10, int(priority) if str(priority).lstrip("-").isdigit() else -1)
             row.setData(8, Qt.ItemDataRole.UserRole + 10, len(archive_files) if isinstance(archive_files, list) else -1)
             row.setData(9, Qt.ItemDataRole.UserRole + 10, len(actions) if isinstance(actions, list) else -1)
@@ -454,6 +253,7 @@ class Kotor2SyncTab(QWidget):
                         f"Mod: {mod_name}",
                         f"Build: {build_name}",
                         f"Enabled: {enabled_label}",
+                        f"Sync: {'Skipped' if skipped else 'Included'}",
                         f"Fetched: {fetched_at or '(unknown)'}",
                         f"KSON version: {version_text}",
                         f"Source URL: {source_url or '(unknown)'}",
@@ -469,9 +269,14 @@ class Kotor2SyncTab(QWidget):
         self._summary_label.setText(f"{self._tree.topLevelItemCount()} mods")
         self._update_details()
 
-    # Download missing archives one at a time from the cached KSON.
+
     def _download_missing_archives(self):
-        if self._download_process is not None or self._browser_waiting is not None or self._validation_thread is not None:
+        if (
+            self._download_process is not None
+            or self._browser_waiting is not None
+            or self._download_validation_thread is not None
+            or self._validation_thread is not None
+        ):
             return
         self._download_queue = []
         for index in range(self._tree.topLevelItemCount()):
@@ -479,42 +284,48 @@ class Kotor2SyncTab(QWidget):
             mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
             if not isinstance(mod, dict):
                 continue
+            if self._row_is_sync_skipped(row):
+                continue
             archive_name = self._expected_archive_name(mod)
             url = str(mod.get("url") or "").strip()
-            if archive_name and self._archive_path_for_mod(mod) is None:
+            if archive_name and row.text(0) not in {"Hash OK", "Empty OK"}:
                 self._download_queue.append((row, mod))
                 continue
-            if not archive_name and url:
+            if not archive_name and url and row.text(0) not in {"Hash OK", "Empty OK"}:
                 self._download_queue.append((row, mod))
 
         if not self._download_queue:
             self._details.setPlainText("No missing archives to download.")
-            logger.info("[KOTOR2 Sync] No missing archives to download.")
             return
 
         self._download_btn.setEnabled(False)
         self._stop_download_btn.setEnabled(True)
         self._details.setPlainText(f"Downloading {len(self._download_queue)} missing archive(s) one at a time.")
-        logger.info(f"[KOTOR2 Sync] Downloading {len(self._download_queue)} missing archive(s).")
+        _log_info(f"Download queue started: {len(self._download_queue)} missing archive(s).")
         self._process_next_download()
 
-    # Start the next queued missing archive download.
+
     def _process_next_download(self):
         if not self._download_queue:
             self._download_btn.setEnabled(True)
             self._stop_download_btn.setEnabled(False)
             self._summary_label.setText("Download queue complete")
             self._details.appendPlainText("\nDownload queue complete.")
-            logger.info("[KOTOR2 Sync] Download queue complete.")
+            _log_info("Download queue complete.")
             return
 
         row, mod = self._download_queue.pop(0)
+        if self._row_is_sync_skipped(row):
+            QTimer.singleShot(0, self._process_next_download)
+            return
         mod_name = self._kson_mod_name(mod)
         archive_name = self._expected_archive_name(mod)
         if archive_name:
-            existing_archive_path = self._archive_path_for_mod(mod)
+            existing_archive_path = self._row_archive_path(row)
             if existing_archive_path is not None:
-                self._mark_downloaded(row, mod, existing_archive_path, "Archive already exists in downloads.")
+                self._mark_downloaded(row, mod, existing_archive_path, "Archive already exists in downloads.", continue_queue=True)
+                return
+            if row.text(0) in {"Hash OK", "Empty OK"}:
                 QTimer.singleShot(0, self._process_next_download)
                 return
         url = str(mod.get("url") or "").strip()
@@ -544,7 +355,7 @@ class Kotor2SyncTab(QWidget):
             return
         self._start_browser_download(row, mod, url, "Browser fallback")
 
-    # Download one DeadlyStream file with DeadlyScraper.exe.
+
     def _start_deadlystream_download(self, row: QTreeWidgetItem, mod: dict, url: str, archive_name: str) -> bool:
         scraper = Path(__file__).resolve().parent / "DeadlyScraper.exe"
         if not scraper.exists():
@@ -576,7 +387,7 @@ class Kotor2SyncTab(QWidget):
         process.start(str(scraper), args)
         return True
 
-    # Finish one DeadlyScraper download and fall back if the expected archive is still missing.
+
     def _finish_deadlystream_download(self, row: QTreeWidgetItem, mod: dict, process: QProcess):
         stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
         stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
@@ -592,16 +403,10 @@ class Kotor2SyncTab(QWidget):
             self._download_btn.setEnabled(True)
             self._stop_download_btn.setEnabled(False)
             return
-        archive_path = self._archive_path_for_mod(mod)
-        if archive_path is not None:
-            self._mark_downloaded(row, mod, archive_path, "Downloaded with DeadlyScraper.")
-            QTimer.singleShot(0, self._process_next_download)
-            return
         existing_names = context[2] if context is not None else set()
         downloaded_path = self._detect_new_download(existing_names)
         if downloaded_path is not None:
-            self._mark_downloaded(row, mod, downloaded_path, "Downloaded with DeadlyScraper.")
-            QTimer.singleShot(0, self._process_next_download)
+            self._mark_downloaded(row, mod, downloaded_path, "Downloaded with DeadlyScraper.", continue_queue=True)
             return
         self._append_download_detail(
             "\n".join(
@@ -624,7 +429,7 @@ class Kotor2SyncTab(QWidget):
             ),
         )
 
-    # Download Nexus files through MO2's nxm handler, with DownloadPopUp browser fallback.
+
     def _start_nexus_download(self, row: QTreeWidgetItem, mod: dict, url: str) -> bool:
         if self._start_nxm_download(row, mod, url):
             return True
@@ -638,7 +443,7 @@ class Kotor2SyncTab(QWidget):
         )
         return False
 
-    # Hand Nexus downloads to MO2 through the registered nxm:// protocol when file_id is known.
+
     def _start_nxm_download(self, row: QTreeWidgetItem, mod: dict, url: str) -> bool:
         mod_id = str(mod.get("mod_id") or mod.get("modID") or "").strip() or self._nexus_mod_id(url)
         file_id = str(mod.get("file_id") or mod.get("fileID") or "").strip()
@@ -650,9 +455,9 @@ class Kotor2SyncTab(QWidget):
             return False
 
         nxm_url = f"nxm://{self._nexus_game_name()}/mods/{mod_id}/files/{file_id}"
+        existing_names = {path.name for path in self._downloads_path().iterdir() if path.is_file()}
         QDesktopServices.openUrl(QUrl(nxm_url))
         self._mark_download_pending(row, mod, f"Opened MO2/Nexus manager link: {nxm_url}")
-        existing_names = {path.name for path in self._downloads_path().iterdir() if path.is_file()}
         self._browser_waiting = (
             row,
             mod,
@@ -666,7 +471,7 @@ class Kotor2SyncTab(QWidget):
         QTimer.singleShot(2000, self._poll_browser_download)
         return True
 
-    # Build Nexus DownloadPopUp URL for browser-based fallback.
+
     def _nexus_download_popup_url(self, mod: dict, url: str) -> str:
         file_id = str(mod.get("file_id") or mod.get("fileID") or "").strip()
         if not file_id or not file_id.isdigit() or int(file_id) <= 0:
@@ -676,7 +481,16 @@ class Kotor2SyncTab(QWidget):
             f"?id={file_id}&game_id={self._nexus_game_id()}&nmm=1"
         )
 
-    # Launch the persistent Edge profile for manual/fallback downloads and poll for the expected archive.
+    def _manual_download_url(self, mod: dict, url: str) -> str:
+        host = urlparse(url).netloc.lower()
+        if "nexusmods.com" not in host:
+            return url
+        mod_id = str(mod.get("mod_id") or mod.get("modID") or "").strip() or self._nexus_mod_id(url)
+        if not mod_id:
+            return url
+        return f"https://www.nexusmods.com/{self._nexus_game_name()}/mods/{mod_id}?tab=files"
+
+
     def _start_browser_download(self, row: QTreeWidgetItem, mod: dict, url: str, reason: str):
         archive_name = self._expected_archive_name(mod)
         downloads_path = self._downloads_path()
@@ -727,7 +541,7 @@ class Kotor2SyncTab(QWidget):
         self._append_download_detail(f"{reason}: opened Edge profile. Waiting for archive download.")
         QTimer.singleShot(2000, self._poll_browser_download)
 
-    # Poll browser downloads and close the Edge window after the expected file appears.
+
     def _poll_browser_download(self):
         if self._browser_waiting is None:
             return
@@ -735,16 +549,15 @@ class Kotor2SyncTab(QWidget):
         detected_path = self._detect_browser_download(expected_path, existing_names)
         if detected_path is not None:
             self._browser_waiting = None
-            self._mark_downloaded(row, mod, detected_path, f"{reason}: browser download detected.")
+            self._mark_downloaded(row, mod, detected_path, f"{reason}: browser download detected.", continue_queue=True)
             QTimer.singleShot(2500, self._close_browser_process)
-            QTimer.singleShot(2600, self._process_next_download)
             return
         if self._browser_process is not None and self._browser_process.poll() is not None:
             self._browser_waiting = None
             self._close_browser_process()
             self._set_validation_row(
                 row,
-                "Skipped",
+                "Failed",
                 self._kson_mod_name(mod),
                 self._expected_archive_name(mod),
                 str(mod.get("archive_xxh3") or "").strip().lower(),
@@ -757,13 +570,17 @@ class Kotor2SyncTab(QWidget):
         if time.monotonic() >= deadline:
             self._browser_waiting = None
             self._close_browser_process()
-            self._mark_download_pending(row, mod, f"{reason}: Edge did not finish within 15 minutes; opened default browser.")
-            QDesktopServices.openUrl(QUrl(url))
-            QTimer.singleShot(0, self._process_next_download)
+            fallback_url = self._nexus_download_popup_url(mod, url) if "nxm" in reason.casefold() else ""
+            if fallback_url:
+                self._start_browser_download(row, mod, fallback_url, "Nexus DownloadPopUp fallback")
+            else:
+                self._mark_download_pending(row, mod, f"{reason}: Edge did not finish within 15 minutes; opened default browser.")
+                QDesktopServices.openUrl(QUrl(url))
+                QTimer.singleShot(0, self._process_next_download)
             return
         QTimer.singleShot(2000, self._poll_browser_download)
 
-    # Detect a completed browser download path.
+
     def _detect_browser_download(self, expected_path: Path, existing_names: set[str]) -> Path | None:
         return self._archive_service().detect_browser_download(expected_path, existing_names)
 
@@ -774,7 +591,7 @@ class Kotor2SyncTab(QWidget):
     def _is_incomplete_download_name(name: str) -> bool:
         return ArchiveService.is_incomplete_download_name(name)
 
-    # Close only the Edge process started for this sandboxed profile when possible.
+
     def _close_browser_process(self):
         process = self._browser_process
         self._browser_process = None
@@ -811,7 +628,7 @@ class Kotor2SyncTab(QWidget):
             self._browser_waiting = None
             self._close_browser_process()
             self._cleanup_download_artifacts(existing_names)
-            self._mark_download_stopped(row, mod, "Browser/NXM download stopped and cleaned up.")
+            self._mark_download_stopped(row, mod, "Browser download stopped and cleaned up.")
         self._download_btn.setEnabled(True)
         self._stop_download_btn.setEnabled(False)
 
@@ -834,28 +651,115 @@ class Kotor2SyncTab(QWidget):
                 except Exception:
                     pass
 
-    # Mark one archive as downloaded and validate its hash.
-    def _mark_downloaded(self, row: QTreeWidgetItem, mod: dict, archive_path: Path, result: str):
-        archive_name = self._expected_archive_name(mod)
-        archive_path, wrap_result = self._wrap_loose_download(archive_path, archive_name)
+
+    def _mark_downloaded(
+        self,
+        row: QTreeWidgetItem,
+        mod: dict,
+        archive_path: Path,
+        result: str,
+        continue_queue: bool = False,
+    ):
+        self._set_validation_row(
+            row,
+            "Hashing",
+            self._kson_mod_name(mod),
+            self._expected_archive_name(mod),
+            str(mod.get("archive_xxh3") or "").strip().lower(),
+            archive_path,
+            "",
+            result,
+        )
+        self._start_download_validation(row, mod, archive_path, result, continue_queue)
+
+    def _start_download_validation(
+        self,
+        row: QTreeWidgetItem,
+        mod: dict,
+        archive_path: Path,
+        result: str,
+        continue_queue: bool,
+    ):
+        if self._download_validation_thread is not None:
+            _log_warning("Download validation skipped: another downloaded archive is already being validated.")
+            if continue_queue:
+                QTimer.singleShot(0, self._process_next_download)
+            return
+        thread = QThread(self)
+        worker = _DownloadedValidationWorker(self._downloads_path(), self._cache_path(), mod, archive_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._finish_download_validation)
+        worker.failed.connect(self._fail_download_validation)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_download_validation_worker)
+        self._download_validation_thread = thread
+        self._download_validation_worker = worker
+        self._download_validation_context = (row, mod, archive_path, result, continue_queue)
+        thread.start()
+
+    def _finish_download_validation(self, payload: dict):
+        context = self._download_validation_context
+        if context is None:
+            return
+        row, mod, archive_path, result, continue_queue = context
+        archive_path_text = str(payload.get("archive_path") or "")
+        if archive_path_text:
+            archive_path = Path(archive_path_text)
+        wrap_result = str(payload.get("wrap_result") or "")
         if wrap_result:
             result = f"{result}\n{wrap_result}"
-        validation_result = self._validate_archive_row_from_mod(row, mod)
+        validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+        self._apply_validation_result(row, validation)
+        validation_result = str(validation.get("bucket") or "skipped")
         if validation_result == "ok":
             self._capture_downloaded_archive_metadata(mod, archive_path)
             row.setText(4, self._display_archive_name(mod))
             self._write_archive_meta(mod, archive_path)
         details = str(row.data(0, Qt.ItemDataRole.UserRole) or "")
         if details:
-            details = details.replace(f"Result: {row.text(0)}", f"Result: {result}", 1)
+            details = f"{details}\n\nDownload: {result}"
             for column in range(row.columnCount()):
                 row.setData(column, Qt.ItemDataRole.UserRole, details)
         if self._tree.currentItem() is row:
             self._details.setPlainText(str(row.data(0, Qt.ItemDataRole.UserRole) or ""))
         if validation_result == "ok":
             row.setText(0, "Hash OK")
+        if continue_queue:
+            self._download_validation_continue_pending = True
 
-    # Mark one download request as handed off to an external downloader/browser.
+    def _fail_download_validation(self, message: str):
+        context = self._download_validation_context
+        if context is None:
+            return
+        row, mod, archive_path, _result, continue_queue = context
+        self._set_validation_row(
+            row,
+            "Hash Fail",
+            self._kson_mod_name(mod),
+            self._expected_archive_name(mod),
+            str(mod.get("archive_xxh3") or "").strip().lower(),
+            archive_path,
+            "",
+            f"Downloaded archive validation failed: {message}",
+        )
+        _log_warning(f"Downloaded archive validation failed: {message}")
+        if continue_queue:
+            self._download_validation_continue_pending = True
+
+    def _clear_download_validation_worker(self):
+        self._download_validation_thread = None
+        self._download_validation_worker = None
+        self._download_validation_context = None
+        continue_pending = self._download_validation_continue_pending
+        self._download_validation_continue_pending = False
+        if continue_pending:
+            QTimer.singleShot(self._DOWNLOAD_QUEUE_DELAY_MS, self._process_next_download)
+
+
     def _mark_download_pending(self, row: QTreeWidgetItem, mod: dict, result: str):
         self._set_validation_row(
             row,
@@ -868,7 +772,7 @@ class Kotor2SyncTab(QWidget):
             result,
         )
 
-    # Mark one download as failed and keep the queue moving.
+
     def _mark_download_failed(self, row: QTreeWidgetItem, mod: dict, result: str):
         self._set_validation_row(
             row,
@@ -893,14 +797,14 @@ class Kotor2SyncTab(QWidget):
             result,
         )
 
-    # Append a message to the details box without replacing current context.
+
     def _append_download_detail(self, text: str, warning: bool = False):
         if text:
             self._details.appendPlainText(f"\n{text}")
             if warning:
-                logger.warning(f"[KOTOR2 Sync] {text}")
+                _log_warning(text)
 
-    # Start fetching the latest KSON in a worker thread.
+
     def _start_fetch_latest_manifest(self):
         thread = QThread(self)
         worker = _FetchWorker(
@@ -927,10 +831,9 @@ class Kotor2SyncTab(QWidget):
         self._sync_btn.setEnabled(False)
         self._summary_label.setText("Fetching KSON...")
         self._details.setPlainText("Fetching latest KSON manifest...")
-        logger.info("[KOTOR2 Sync] Starting KSON fetch.")
         thread.start()
 
-    # Finish a successful KSON fetch.
+
     def _finish_fetch_latest_manifest(self, result: dict):
         self.refresh()
         details = str(result.get("details") or "")
@@ -938,14 +841,14 @@ class Kotor2SyncTab(QWidget):
         if current is not None:
             current.setData(0, Qt.ItemDataRole.UserRole, details)
         self._details.setPlainText(details)
-        logger.info(f"[KOTOR2 Sync] Loaded {result.get('mod_count')} mods from {result.get('selected_path')}.")
+        _log_info(f"KSON loaded: {result.get('mod_count')} mod(s).")
         for warning in result.get("warnings", []):
-            logger.warning(f"[KOTOR2 Sync] Fetch warning: {warning}")
+            _log_warning(f"Fetch warning: {warning}")
         self._validate_archives()
 
-    # Show a failed KSON fetch.
+
     def _fail_fetch_latest_manifest(self, message: str, errors: list[str]):
-        logger.warning(f"[KOTOR2 Sync] Failed to load KSON: {message}")
+        _log_warning(f"Failed to load KSON: {message}")
         self._tree.clear()
         row = QTreeWidgetItem(["Error", "", "Fetch failed", "", "", "", "", "See details", "", ""])
         row.setData(
@@ -965,7 +868,7 @@ class Kotor2SyncTab(QWidget):
         self._summary_label.setText("0 mods")
         self._update_details()
 
-    # Clear fetch worker references.
+
     def _clear_fetch_worker(self):
         self._fetch_thread = None
         self._fetch_worker = None
@@ -974,12 +877,12 @@ class Kotor2SyncTab(QWidget):
             self._download_btn.setEnabled(True)
         self._update_sync_button_state()
 
-    # Show details for the current row.
+
     def _update_details(self):
         item = self._tree.currentItem()
         self._details.setPlainText(str(item.data(0, Qt.ItemDataRole.UserRole) or "") if item else "")
 
-    # Show the row context menu.
+
     def _show_context_menu(self, pos: QPoint):
         row = self._tree.itemAt(pos)
         if row is None:
@@ -989,22 +892,43 @@ class Kotor2SyncTab(QWidget):
             return
 
         archive_name = self._display_archive_name(mod)
-        archive_path = self._archive_path_for_mod(mod) if archive_name else None
+        archive_path = self._row_archive_path(row)
         url = str(mod.get("url") or "").strip()
 
         menu = QMenu(self)
+        skip_action = menu.addAction("Unskip" if self._row_is_sync_skipped(row) else "Skip")
         download_action = menu.addAction("Download")
+        manual_download_action = menu.addAction("Manual Download")
         webpage_action = menu.addAction("View Web Page")
         hash_action = menu.addAction("Hash Check")
         explorer_action = menu.addAction("Open in Explorer")
 
-        if self._download_process is not None or self._browser_waiting is not None:
+        if (
+            self._validation_thread is not None
+            or self._sync_busy
+            or self._download_process is not None
+            or self._browser_waiting is not None
+            or self._download_validation_thread is not None
+        ):
+            skip_action.setEnabled(False)
+        if (
+            self._download_process is not None
+            or self._browser_waiting is not None
+            or self._download_validation_thread is not None
+        ):
             download_action.setEnabled(False)
+            manual_download_action.setEnabled(False)
         if self._validation_thread is not None:
             download_action.setEnabled(False)
+            manual_download_action.setEnabled(False)
+            hash_action.setEnabled(False)
+        if self._row_is_sync_skipped(row):
+            download_action.setEnabled(False)
+            manual_download_action.setEnabled(False)
             hash_action.setEnabled(False)
         if not url:
             webpage_action.setEnabled(False)
+            manual_download_action.setEnabled(False)
         if not archive_name:
             download_action.setEnabled(False)
             hash_action.setEnabled(False)
@@ -1012,8 +936,12 @@ class Kotor2SyncTab(QWidget):
             explorer_action.setEnabled(False)
 
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if chosen is download_action:
+        if chosen is skip_action:
+            self._set_row_sync_skipped(row, mod, not self._row_is_sync_skipped(row))
+        elif chosen is download_action:
             self._download_selected_row(row, mod)
+        elif chosen is manual_download_action:
+            self._manual_download_selected_row(row, mod)
         elif chosen is webpage_action and url:
             QDesktopServices.openUrl(QUrl(url))
         elif chosen is hash_action:
@@ -1021,25 +949,52 @@ class Kotor2SyncTab(QWidget):
         elif chosen is explorer_action and archive_path is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(archive_path.parent)))
 
-    # Download the archive for one selected row.
+
     def _download_selected_row(self, row: QTreeWidgetItem, mod: dict):
-        if self._download_process is not None or self._browser_waiting is not None or self._validation_thread is not None:
+        if (
+            self._download_process is not None
+            or self._browser_waiting is not None
+            or self._download_validation_thread is not None
+            or self._validation_thread is not None
+        ):
+            return
+        if self._row_is_sync_skipped(row):
             return
         self._download_queue = [(row, mod)]
         self._download_btn.setEnabled(False)
         self._process_next_download()
 
-    # Validate one archive row.
+    def _manual_download_selected_row(self, row: QTreeWidgetItem, mod: dict):
+        if (
+            self._download_process is not None
+            or self._browser_waiting is not None
+            or self._download_validation_thread is not None
+            or self._validation_thread is not None
+        ):
+            return
+        if self._row_is_sync_skipped(row):
+            return
+        url = str(mod.get("url") or "").strip()
+        if not url:
+            return
+        manual_url = self._manual_download_url(mod, url)
+        self._download_queue = []
+        self._download_btn.setEnabled(False)
+        self._start_browser_download(row, mod, manual_url, "Manual download")
+
+
     def _validate_archive_row(self, row: QTreeWidgetItem):
         if self._validation_thread is not None:
             return
         mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
         if not isinstance(mod, dict):
             return
+        if self._row_is_sync_skipped(row):
+            return
         self._validate_archive_row_from_mod(row, mod)
         self._update_details()
 
-    # Validate one archive row from its KSON entry.
+
     def _validate_archive_row_from_mod(
         self,
         row: QTreeWidgetItem,
@@ -1050,24 +1005,25 @@ class Kotor2SyncTab(QWidget):
         self._apply_validation_result(row, result)
         return str(result.get("bucket") or "skipped")
 
-    # Validate local archive files against archive names and XXH3 hashes in the cached KSON.
+
     def _validate_archives(self):
         kson = self._read_cached_kson()
         if not kson:
             self._details.setPlainText("No cached KSON is loaded. Fetch or place a local KSON first.")
-            logger.warning("[KOTOR2 Sync] Archive validation skipped: no cached KSON.")
+            _log_warning("Archive validation skipped: no cached KSON.")
             return
         if self._validation_thread is not None:
             return
 
         rows = [self._tree.topLevelItem(index) for index in range(self._tree.topLevelItemCount())]
+        validation_rows = [row for row in rows if not self._row_is_sync_skipped(row)]
         row_specs = [
             {
-                "row_index": index,
+                "row_index": rows.index(row),
                 "mod": row.data(0, Qt.ItemDataRole.UserRole + 1),
                 "mod_name": row.text(2),
             }
-            for index, row in enumerate(rows)
+            for row in validation_rows
         ]
 
         self._validated_for_sync = False
@@ -1075,7 +1031,7 @@ class Kotor2SyncTab(QWidget):
         self._validation_sorting_enabled = self._tree.isSortingEnabled()
         self._tree.setSortingEnabled(False)
         for row in rows:
-            row.setText(0, "Queued")
+            row.setText(0, "Skip" if self._row_is_sync_skipped(row) else "Queued")
 
         thread = QThread(self)
         worker = _ValidationWorker(self._cache_path(), self._downloads_path(), kson, row_specs)
@@ -1094,13 +1050,9 @@ class Kotor2SyncTab(QWidget):
         self._refresh_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
         self._sync_btn.setEnabled(False)
-        self._summary_label.setText(f"Validating 0/{len(rows)}")
+        self._summary_label.setText(f"Validating 0/{len(validation_rows)}")
         self._details.setPlainText("Validating downloaded archives...")
-        logger.info("[KOTOR2 Sync] Starting archive validation.")
         thread.start()
-
-    def _prepare_tslrcm_archives_for_validation(self, kson: dict):
-        self._archive_service().prepare_tslrcm_archives_for_validation(kson)
 
     def _archive_service(self) -> ArchiveService:
         return ArchiveService(self._downloads_path(), self._cache_path())
@@ -1132,11 +1084,17 @@ class Kotor2SyncTab(QWidget):
             f"{counts['ok']} ok | {counts['empty']} empty | {counts['missing']} missing | "
             f"{counts['mismatch']} mismatch | {counts['skipped']} skipped"
         )
-        logger.info(
-            f"[KOTOR2 Sync] Archive validation: {counts['ok']} ok, {counts['empty']} empty, "
-            f"{counts['missing']} missing, {counts['mismatch']} mismatch, {counts['skipped']} skipped."
-        )
-        self._validated_for_sync = counts["missing"] == 0 and counts["mismatch"] == 0 and counts["skipped"] == 0
+        if counts["missing"] or counts["mismatch"] or counts["skipped"]:
+            _log_warning(
+                f"Archive validation needs attention: {counts['ok']} ok, {counts['empty']} empty, "
+                f"{counts['missing']} missing, {counts['mismatch']} mismatch, {counts['skipped']} skipped."
+            )
+        else:
+            _log_info(f"Archive validation passed: {counts['ok']} ok, {counts['empty']} empty.")
+        if counts["missing"] == 0 and counts["mismatch"] == 0 and counts["skipped"] == 0:
+            self._refresh_validated_for_current_rows()
+        else:
+            self._validated_for_sync = False
         self._update_sync_button_state()
         self._update_details()
 
@@ -1145,7 +1103,7 @@ class Kotor2SyncTab(QWidget):
         self._validated_for_sync = False
         self._summary_label.setText("Validation failed")
         self._details.setPlainText(f"Archive validation failed:\n{message}")
-        logger.warning(f"[KOTOR2 Sync] Archive validation failed: {message}")
+        _log_warning(f"Archive validation failed: {message}")
         self._update_sync_button_state()
 
     def _restore_validation_sorting(self):
@@ -1163,17 +1121,39 @@ class Kotor2SyncTab(QWidget):
             self._download_btn.setEnabled(True)
         self._update_sync_button_state()
 
-    # Install the validated KSON into MO2 mods and update profile modlist.txt.
+
     def _sync_validated_build(self):
         if not self._validated_for_sync or self._sync_thread is not None or self._sync_busy or self._validation_thread is not None:
             return
         kson_path = self._cache_path()
         if not kson_path.exists():
             self._details.setPlainText("No cached KSON is available to sync.")
-            logger.warning("[KOTOR2 Sync] Sync skipped: no cached KSON.")
+            _log_warning("Sync skipped: no cached KSON.")
+            return
+        response = QMessageBox.warning(
+            self,
+            "Confirm Sync",
+            "\n".join(
+                [
+                    "Sync will delete and rebuild your mod list.",
+                    "",
+                    "To keep custom mods from being overwritten, add [NODELETE] to the beginning of their name.",
+                    "",
+                    "Do you want to continue?",
+                ]
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        sync_kson_path = self._write_sync_kson_for_current_rows(kson_path)
+        if sync_kson_path is None:
+            self._details.setPlainText("Sync failed before starting: could not prepare the skipped-mod list.")
+            _log_warning("Sync skipped: could not prepare filtered KSON.")
             return
         thread = QThread(self)
-        worker = _SyncWorker(kson_path, self._downloads_path(), Path(self._organizer.modsPath()), Path(self._organizer.profilePath()))
+        worker = _SyncWorker(sync_kson_path, self._downloads_path(), Path(self._organizer.modsPath()), Path(self._organizer.profilePath()))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._update_sync_progress)
@@ -1190,7 +1170,7 @@ class Kotor2SyncTab(QWidget):
         self._sync_busy = True
         self._update_sync_button_state()
         self._details.setPlainText("Starting sync...")
-        logger.info(f"[KOTOR2 Sync] Starting sync from {kson_path}.")
+        _log_info("Sync started.")
         thread.start()
 
     def _update_sync_progress(self, current: int, total: int, mod_name: str, status: str):
@@ -1206,16 +1186,16 @@ class Kotor2SyncTab(QWidget):
             details.extend(["", "Warnings:", *result.warnings[:30]])
         self._details.setPlainText("\n".join(details))
         self._summary_label.setText(f"Synced {result.mod_count} mods")
-        logger.info(f"[KOTOR2 Sync] Synced {result.mod_count} mod(s).")
+        _log_info(f"Sync finished: {result.mod_count} mod(s).")
         for warning in result.warnings[:30]:
-            logger.warning(f"[KOTOR2 Sync] {warning}")
+            _log_warning(warning)
         refresh_mo2(self._organizer, self)
         QTimer.singleShot(750, self._run_post_sync_steps)
 
     def _fail_sync(self, message: str):
         self._details.setPlainText(f"Sync failed:\n{message}")
         self._summary_label.setText("Sync failed")
-        logger.warning(f"[KOTOR2 Sync] Sync failed: {message}")
+        _log_warning(f"Sync failed: {message}")
         self._sync_busy = False
         self._update_sync_button_state()
         refresh_mo2(self._organizer, self)
@@ -1223,14 +1203,20 @@ class Kotor2SyncTab(QWidget):
     def _clear_sync_worker(self):
         self._sync_thread = None
         self._sync_worker = None
+        if self._sync_temp_kson_path is not None:
+            try:
+                self._sync_temp_kson_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._sync_temp_kson_path = None
         self._update_sync_button_state()
 
-    # Run post-sync patcher and texture steps.
+
     def _run_post_sync_steps(self):
         patcher_tab = getattr(self._game, "_patcher_tab", None)
         run_after_sync = getattr(patcher_tab, "run_after_sync", None)
         if not callable(run_after_sync):
-            logger.warning("[KOTOR2 Sync] Patcher tab is not available after sync.")
+            _log_warning("Patcher tab is not available after sync.")
             self._sync_busy = False
             self._update_sync_button_state()
             self._refresh_related_tabs()
@@ -1241,13 +1227,12 @@ class Kotor2SyncTab(QWidget):
         try:
             run_after_sync()
             self._details.appendPlainText("Patcher finished.")
-            logger.info("[KOTOR2 Sync] Patcher finished after sync.")
             self._run_texture_auto_fix_after_sync()
             self._summary_label.setText("Sync, patcher, and texture autofix complete")
         except Exception as exc:
             self._summary_label.setText("Sync complete; post-sync step failed")
             self._details.appendPlainText(f"Post-sync step failed:\n{exc}")
-            logger.warning(f"[KOTOR2 Sync] Post-sync step failed: {exc}")
+            _log_warning(f"Post-sync step failed: {exc}")
         self._sync_busy = False
         self._update_sync_button_state()
         self._refresh_related_tabs()
@@ -1261,21 +1246,20 @@ class Kotor2SyncTab(QWidget):
             and self._validation_thread is None
         )
 
-    # Refresh textures and run the auto-fix loop after patching.
+
     def _run_texture_auto_fix_after_sync(self):
         texture_tab = getattr(self._game, "_texture_tab", None)
         run_auto_fix = getattr(texture_tab, "run_auto_fix_after_sync", None)
         if not callable(run_auto_fix):
-            logger.warning("[KOTOR2 Sync] Texture tab is not available after sync.")
+            _log_warning("Texture tab is not available after sync.")
             return
 
         self._summary_label.setText("Running texture autofix")
         self._details.appendPlainText("Running texture autofix...")
         run_auto_fix()
         self._details.appendPlainText("Texture autofix finished.")
-        logger.info("[KOTOR2 Sync] Texture autofix finished after sync.")
 
-    # Refresh custom tabs that read the mod list.
+
     def _refresh_related_tabs(self):
         for attr_name in ("_patcher_tab", "_texture_tab"):
             tab = getattr(self._game, attr_name, None)
@@ -1295,6 +1279,7 @@ class Kotor2SyncTab(QWidget):
         result: str,
     ):
         row.setText(0, state)
+        row.setData(0, Qt.ItemDataRole.UserRole + 3, str(archive_path) if archive_path is not None else "")
         details = "\n".join(
             [
                 f"Mod: {mod_name}",
@@ -1313,19 +1298,124 @@ class Kotor2SyncTab(QWidget):
         if self._tree.currentItem() is row:
             self._details.setPlainText(details)
 
-    # Return the current game build key used for remote lookup and cache naming.
+    def _row_archive_path(self, row: QTreeWidgetItem) -> Path | None:
+        value = str(row.data(0, Qt.ItemDataRole.UserRole + 3) or "").strip()
+        if not value:
+            return None
+        path = Path(value)
+        return path if path.exists() else None
+
+    def _row_is_sync_skipped(self, row: QTreeWidgetItem) -> bool:
+        return bool(row.data(0, Qt.ItemDataRole.UserRole + 2))
+
+    def _set_row_sync_skipped(self, row: QTreeWidgetItem, mod: dict, skipped: bool):
+        row.setData(0, Qt.ItemDataRole.UserRole + 2, skipped)
+        if skipped:
+            mod["_sync_skip"] = True
+            self._set_validation_row(
+                row,
+                "Skip",
+                self._kson_mod_name(mod),
+                self._expected_archive_name(mod),
+                str(mod.get("archive_xxh3") or "").strip().lower(),
+                None,
+                "",
+                "This mod is skipped and will not be downloaded or synced.",
+            )
+        else:
+            mod.pop("_sync_skip", None)
+            row.setText(0, "Ready")
+            self._update_row_sync_details(row, mod)
+        self._write_cached_kson_mod_update(mod)
+        self._refresh_validated_for_current_rows()
+        self._update_sync_button_state()
+        if self._tree.currentItem() is row:
+            self._update_details()
+
+    def _update_row_sync_details(self, row: QTreeWidgetItem, mod: dict):
+        skipped = self._kson_mod_skipped(mod)
+        details = "\n".join(
+            [
+                f"Mod: {self._kson_mod_name(mod)}",
+                f"Sync: {'Skipped' if skipped else 'Included'}",
+                f"Archive name: {self._display_archive_name(mod) or '(none)'}",
+                f"Cache file: {self._cache_path()}",
+            ]
+        )
+        for column in range(row.columnCount()):
+            row.setData(column, Qt.ItemDataRole.UserRole, details)
+
+    def _refresh_validated_for_current_rows(self):
+        valid_states = {"Hash OK", "Empty OK"}
+        has_included = False
+        for index in range(self._tree.topLevelItemCount()):
+            row = self._tree.topLevelItem(index)
+            if self._row_is_sync_skipped(row):
+                continue
+            has_included = True
+            if row.text(0) not in valid_states:
+                self._validated_for_sync = False
+                return
+        self._validated_for_sync = has_included
+
+    def _write_sync_kson_for_current_rows(self, source_path: Path) -> Path | None:
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+            mods = payload.get("mods", [])
+            if not isinstance(mods, list):
+                return None
+
+            skipped_keys: set[tuple[str, str]] = set()
+            for index in range(self._tree.topLevelItemCount()):
+                row = self._tree.topLevelItem(index)
+                mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
+                if not isinstance(mod, dict) or not self._row_is_sync_skipped(row):
+                    continue
+                skipped_keys.add((self._kson_mod_name(mod), str(mod.get("priority") or "").strip()))
+
+            filtered_mods = []
+            for mod in mods:
+                if not isinstance(mod, dict):
+                    continue
+                key = (self._kson_mod_name(mod), str(mod.get("priority") or "").strip())
+                if key in skipped_keys or self._kson_mod_skipped(mod):
+                    continue
+                filtered_mods.append(mod)
+            payload["mods"] = filtered_mods
+
+            if self._sync_temp_kson_path is not None:
+                try:
+                    self._sync_temp_kson_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._sync_temp_kson_path = None
+
+            handle, temp_name = tempfile.mkstemp(
+                prefix=f"{self._build_key()}_sync_",
+                suffix=".kson",
+                dir=str(self._cache_path().parent),
+            )
+            os.close(handle)
+            temp_path = Path(temp_name)
+            temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._sync_temp_kson_path = temp_path
+            return temp_path
+        except Exception:
+            return None
+
+
     def _build_key(self) -> str:
         return "kotor2" if self._game.gameShortName().lower() == "kotor2" else "kotor"
 
-    # Return the profile-local directory for downloaded and local KSON manifests.
+
     def _kson_dir(self) -> Path:
         return Path(self._organizer.profilePath()) / "kson"
 
-    # Return the local cache path for the selected KSON.
+
     def _cache_path(self) -> Path:
         return self._kson_dir() / f"{self._build_key()}_latest_build.kson"
 
-    # Return the displayed cached KSON timestamp.
+
     def _cached_kson_version_text(self) -> str:
         cache_path = self._cache_path()
         source_url = ""
@@ -1343,7 +1433,7 @@ class Kotor2SyncTab(QWidget):
                 return version_text
         return self._latest_local_kson_version_text()
 
-    # Return the newest timestamped local KSON version text.
+
     def _latest_local_kson_version_text(self) -> str:
         candidates = [
             _kson_version_text_from_name(path.name)
@@ -1354,7 +1444,7 @@ class Kotor2SyncTab(QWidget):
         known = [candidate for candidate in candidates if candidate != "unknown"]
         return max(known) if known else "unknown"
 
-    # Check if a KSON filename is for this game.
+
     def _is_game_kson_path(self, path: str) -> bool:
         name = Path(path).name.lower()
         if not name.endswith(".kson"):
@@ -1363,7 +1453,7 @@ class Kotor2SyncTab(QWidget):
             return name.startswith("kotor2")
         return name.startswith("kotor") and not name.startswith("kotor2")
 
-    # Resolve one or more archive names to a file in MO2 downloads.
+
     def _archive_path(self, *archive_names: str) -> Path | None:
         return self._archive_service().resolve_named_archive_path(*archive_names)
 
@@ -1441,7 +1531,7 @@ class Kotor2SyncTab(QWidget):
             release_date = self._normalize_release_date(str(version.get("ReleaseDate") or ""))
             if release_date != expected_release_date:
                 continue
-            download_url = str(version.get("DownloadPageUrl") or "").strip()
+            download_url = str(version.get("ChangelogUrl") or version.get("DownloadPageUrl") or "").strip()
             if download_url:
                 version_label = str(version.get("VersionLabel") or "").strip()
                 if version_label:
@@ -1449,102 +1539,30 @@ class Kotor2SyncTab(QWidget):
                 return download_url, f"DeadlyScraper selected the DeadlyStream version published on {expected_release_date}."
         return "", f"No DeadlyStream version matches KSON release date {expected_release_date} for {self._kson_mod_name(mod)}."
 
-    # Wrap a loose download in an uncompressed ZIP.
-    def _wrap_loose_download(self, archive_path: Path, archive_name: str) -> tuple[Path, str]:
-        converted_path, converted_result = self._convert_tslrcm_installer_if_needed(archive_path, archive_name)
-        if converted_path != archive_path or converted_result:
-            return converted_path, converted_result
-        if self._is_known_archive(archive_path):
-            return archive_path, ""
-        expected_name = html.unescape(archive_name).strip()
-        if expected_name:
-            wrapped_path = archive_path.with_name(expected_name)
-        else:
-            wrapped_path = archive_path.with_name(f"{archive_path.name}.zip")
-        if wrapped_path.suffix.lower() != ".zip":
-            wrapped_path = wrapped_path.with_name(f"{wrapped_path.name}.zip")
-        temp_path = wrapped_path.with_name(f"{wrapped_path.name}.tmp")
-        seven_zip = self._seven_zip_exe()
-        if seven_zip:
-            result = subprocess.run(
-                [seven_zip, "a", "-tzip", "-mx=0", str(temp_path), archive_path.name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                startupinfo=self._subprocess_startupinfo(),
-                creationflags=self._subprocess_creationflags(),
-                cwd=str(archive_path.parent),
-            )
-            if result.returncode == 0 and temp_path.exists():
-                temp_path.replace(wrapped_path)
-                if archive_path != wrapped_path and archive_path.exists():
-                    archive_path.unlink()
-                return wrapped_path, f"Wrapped loose file as uncompressed ZIP with 7-Zip: {wrapped_path.name}"
-
-        original_bytes = archive_path.read_bytes()
-        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
-            archive.writestr(archive_path.name, original_bytes, compress_type=zipfile.ZIP_STORED)
-        temp_path.replace(wrapped_path)
-        if archive_path != wrapped_path and archive_path.exists():
-            archive_path.unlink()
-        return wrapped_path, f"Wrapped loose file as uncompressed ZIP: {wrapped_path.name}"
-
-    # Convert a downloaded TSLRCM 2022 installer into the expected archive when possible.
-    def _convert_tslrcm_installer_if_needed(self, archive_path: Path, archive_name: str) -> tuple[Path, str]:
-        return self._archive_service().convert_tslrcm_installer_if_needed(archive_path, archive_name)
-
-    # Try to convert a matching TSLRCM installer already present in downloads.
-    def _convert_matching_tslrcm_installer(self, archive_name: str) -> Path | None:
-        return self._archive_service().convert_matching_tslrcm_installer(archive_name)
-
-    # Check whether a path is the known TSLRCM 2022 installer.
-    @staticmethod
-    def _is_tslrcm_installer_path(path: Path) -> bool:
-        return ArchiveService.is_tslrcm_installer_path(path)
-
-    @classmethod
-    def _should_convert_tslrcm_installer(cls, path: Path, archive_name: str) -> bool:
-        return ArchiveService.should_convert_tslrcm_installer(path, archive_name)
-
     @staticmethod
     def _is_tslrcm_expected_archive_name(name: str) -> bool:
         return ArchiveService.is_tslrcm_expected_archive_name(name)
 
-    @staticmethod
-    def _tslrcm_archive_output_name(name: str) -> str:
-        return ArchiveService.tslrcm_archive_output_name(name)
 
-    # Return the bundled 7-Zip executable.
     @staticmethod
     def _seven_zip_exe() -> str:
         return ArchiveService.seven_zip_exe()
 
-    # Return Windows subprocess startup info when needed.
+
     @staticmethod
     def _subprocess_startupinfo():
         return ArchiveService.subprocess_startupinfo()
 
-    # Return Windows subprocess creation flags when needed.
+
     @staticmethod
     def _subprocess_creationflags() -> int:
         return ArchiveService.subprocess_creationflags()
 
-    # Check whether a download is already an archive.
-    @staticmethod
-    def _is_archive_file(path: Path) -> bool:
-        return ArchiveService.is_archive_file(path)
 
-    # Check whether a path is a real archive, not just an archive-named file.
-    def _is_known_archive(self, path: Path) -> bool:
-        return self._archive_service().is_known_archive(path)
-
-    # Return MO2's downloads folder as a Path.
     def _downloads_path(self) -> Path:
         return Path(self._organizer.downloadsPath())
 
-    # Return the Nexus game identifier used by MO2 where available.
+
     def _nexus_game_name(self) -> str:
         try:
             value = self._game.gameNexusName()
@@ -1554,7 +1572,7 @@ class Kotor2SyncTab(QWidget):
             pass
         return self._game.gameShortName().lower()
 
-    # Return Nexus numeric game id for DownloadPopUp URLs.
+
     def _nexus_game_id(self) -> str:
         game_name = self._nexus_game_name()
         if game_name == "kotor":
@@ -1569,13 +1587,13 @@ class Kotor2SyncTab(QWidget):
             pass
         return "234" if self._build_key() == "kotor" else "198"
 
-    # Extract the Nexus mod id from a URL.
+
     @staticmethod
     def _nexus_mod_id(url: str) -> str:
         match = re.search(r"/mods/(\d+)", url)
         return match.group(1) if match else ""
 
-    # Locate the Edge browser executable for browser fallback.
+
     @staticmethod
     def _edge_path() -> Path | None:
         candidates = [
@@ -1587,7 +1605,7 @@ class Kotor2SyncTab(QWidget):
                 return candidate
         return None
 
-    # Seed the persistent Edge profile with the MO2 downloads folder and scrub crash markers.
+
     @staticmethod
     def _prepare_edge_profile(profile_dir: Path, downloads_path: Path):
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -1604,6 +1622,7 @@ class Kotor2SyncTab(QWidget):
         prefs["download"]["default_directory"] = str(downloads_path)
         prefs["download"]["prompt_for_download"] = False
         prefs.setdefault("profile", {})
+        prefs["profile"].setdefault("default_content_setting_values", {})
         prefs["profile"]["exit_type"] = "Normal"
         prefs["profile"]["exited_cleanly"] = True
         prefs["profile"]["edge_crash_exit_count"] = 0
@@ -1615,7 +1634,7 @@ class Kotor2SyncTab(QWidget):
         (profile_dir / "First Run").write_text("", encoding="ascii")
         Kotor2SyncTab._clear_edge_session_files(profile_dir)
 
-    # Reset crash/session markers without removing cookies or saved logins.
+
     @staticmethod
     def _sanitize_edge_profile(profile_dir: Path):
         default_dir = profile_dir / "Default"
@@ -1626,6 +1645,7 @@ class Kotor2SyncTab(QWidget):
             except Exception:
                 prefs = {}
             prefs.setdefault("profile", {})
+            prefs["profile"].setdefault("default_content_setting_values", {})
             prefs["profile"]["exit_type"] = "Normal"
             prefs["profile"]["exited_cleanly"] = True
             prefs["profile"]["edge_crash_exit_count"] = 0
@@ -1639,7 +1659,7 @@ class Kotor2SyncTab(QWidget):
                 pass
         Kotor2SyncTab._clear_edge_session_files(profile_dir)
 
-    # Drop session-restore artifacts while preserving cookies and login state.
+
     @staticmethod
     def _clear_edge_session_files(profile_dir: Path):
         for relative_name in (
@@ -1666,7 +1686,7 @@ class Kotor2SyncTab(QWidget):
                 except Exception:
                     pass
 
-    # Ask Edge to close its windows before falling back to hard termination.
+
     @staticmethod
     def _request_browser_close(pid: int):
         if os.name != "nt" or pid <= 0:
@@ -1687,7 +1707,7 @@ class Kotor2SyncTab(QWidget):
         except Exception:
             pass
 
-    # Write/update MO2 archive metadata for a downloaded archive.
+
     def _write_archive_meta(self, mod: dict, archive_path: Path):
         archive_name = archive_path.name
         meta_path = archive_path.with_name(f"{archive_name}.meta")
@@ -1745,9 +1765,6 @@ class Kotor2SyncTab(QWidget):
     def _display_archive_name(self, mod: dict) -> str:
         return self._archive_service().display_archive_name(mod)
 
-    def _archive_path_for_mod(self, mod: dict, hash_cache: dict[Path, str] | None = None) -> Path | None:
-        return self._archive_service().resolve_archive_path_for_mod(mod, hash_cache=hash_cache)
-
     def _capture_downloaded_archive_metadata(self, mod: dict, archive_path: Path):
         changed = False
         if not str(mod.get("archive_name") or "").strip():
@@ -1785,6 +1802,10 @@ class Kotor2SyncTab(QWidget):
                 continue
             item["archive_name"] = self._expected_archive_name(mod)
             item["archive_xxh3"] = str(mod.get("archive_xxh3") or "").strip()
+            if self._kson_mod_skipped(mod):
+                item["_sync_skip"] = True
+            else:
+                item.pop("_sync_skip", None)
             item.pop("local_archive_name", None)
             updated = True
             break
@@ -1795,29 +1816,7 @@ class Kotor2SyncTab(QWidget):
         except Exception:
             return
 
-    def _newest_download_for_url(self, url: str) -> Path | None:
-        host = urlparse(url).netloc.casefold()
-        if "deadlystream.com" not in host:
-            return None
-        try:
-            candidates = [
-                path for path in self._downloads_path().iterdir()
-                if path.is_file() and not path.name.casefold().endswith(".meta")
-            ]
-        except Exception:
-            return None
-        return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
 
-    @classmethod
-    def _should_preserve_download_name_for_conversion(cls, archive_path: Path, expected_name: str) -> bool:
-        return (
-            archive_path.exists()
-            and archive_path.is_file()
-            and archive_path.suffix.lower() == ".exe"
-            and cls._is_tslrcm_expected_archive_name(expected_name)
-        )
-
-    # Read the cached KSON when present.
     def _read_cached_kson(self) -> dict | None:
         cache_path = self._cache_path()
         if not cache_path.exists():
@@ -1827,7 +1826,7 @@ class Kotor2SyncTab(QWidget):
         except Exception:
             return None
 
-    # Return a mod name from KSON data.
+
     @staticmethod
     def _kson_mod_name(mod) -> str:
         if isinstance(mod, dict):
@@ -1837,12 +1836,21 @@ class Kotor2SyncTab(QWidget):
             return mod.strip()
         return ""
 
-    # Return true if the KSON mod should be enabled in modlist.txt.
+
     @staticmethod
     def _kson_mod_enabled(mod) -> bool:
         if not isinstance(mod, dict):
             return True
         return bool(mod.get("enabled", True))
+
+    @staticmethod
+    def _kson_mod_skipped(mod) -> bool:
+        if not isinstance(mod, dict):
+            return False
+        value = mod.get("_sync_skip", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _source_label(url: str) -> str:
@@ -1859,8 +1867,8 @@ class Kotor2SyncTab(QWidget):
             return "GitHub"
         return host or "(none)"
 
-    # Count embedded TSLPatcher order entries for display.
-    # Count patch order entries.
+
+
     @staticmethod
     def _patch_order_count(value) -> int:
         if isinstance(value, dict):

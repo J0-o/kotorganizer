@@ -14,7 +14,7 @@ if os.name == "nt":
     SUBPROCESS_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW
 
 
-# Hash one file with xxhsum when available.
+
 def file_hash(path: Path) -> str:
     exe = xxhsum_exe()
     if exe:
@@ -33,12 +33,12 @@ def file_hash(path: Path) -> str:
     return xxh3_bytes(path.read_bytes())
 
 
-# Hash multiple files and return a path-to-hash mapping.
+
 def file_hashes(paths: list[Path]) -> dict[Path, str]:
     return {path: file_hash(path) for path in paths}
 
 
-# Hash bytes with XXH3 or a CRC fallback.
+
 def xxh3_bytes(data: bytes) -> str:
     exe = xxhsum_exe()
     if exe:
@@ -55,7 +55,7 @@ def xxh3_bytes(data: bytes) -> str:
     return f"crc32:{zlib.crc32(data) & 0xFFFFFFFF:08x}"
 
 
-# Find the bundled or system xxhsum executable.
+
 @lru_cache(maxsize=1)
 def xxhsum_exe() -> str:
     for parent in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
@@ -67,7 +67,7 @@ def xxhsum_exe() -> str:
     return exe or ""
 
 
-# Parse the hash value from xxhsum output.
+
 def parse_xxhsum_output(output: str) -> str:
     first = output.strip().split()[0].strip("\\/")
     upper = first.upper()

@@ -11,9 +11,9 @@ from basic_games.basic_features.basic_save_game_info import BasicGameSaveGame, f
 logger = logging.getLogger("mobase")
 
 
-# Represent a single KOTOR II save directory in the saves tab.
+
 class Kotor2SaveGame(BasicGameSaveGame):
-    # Cache the save path and lazy-loaded preview state.
+
     def __init__(self, filepath):
         super().__init__(filepath)
         self._path = Path(filepath)
@@ -21,11 +21,11 @@ class Kotor2SaveGame(BasicGameSaveGame):
         self._screenshot_path: Path | None = None
         self._screenshot_checked = False
 
-    # Return the display name for the save slot.
+
     def getName(self) -> str:
         return self._path.name
 
-    # Return the save directory modification time.
+
     def getCreationTime(self) -> QDateTime:
         if self._creation_time is None:
             try:
@@ -36,7 +36,7 @@ class Kotor2SaveGame(BasicGameSaveGame):
                 self._creation_time = QDateTime()
         return self._creation_time
 
-    # Find the screenshot file associated with the save.
+
     def _find_screenshot_path(self) -> Path | None:
         if not self._screenshot_checked:
             self._screenshot_checked = True
@@ -47,7 +47,7 @@ class Kotor2SaveGame(BasicGameSaveGame):
                     break
         return self._screenshot_path
 
-    # Decode the save screenshot into a pixmap.
+
     def getScreenshot(self):
         tga_path = self._find_screenshot_path()
         if tga_path is None:
@@ -81,17 +81,17 @@ class Kotor2SaveGame(BasicGameSaveGame):
             logger.warning(f"[KOTOR2] Screenshot decode failed: {e}")
             return QPixmap()
 
-    # Cache the decoded screenshot pixmap.
+
     def _pixmap(self):
         if not hasattr(self, "_cached_pixmap"):
             self._cached_pixmap = self.getScreenshot()
         return self._cached_pixmap
 
-    # Report whether the cached screenshot is empty.
+
     def isNull(self):
         return self._pixmap().isNull()
 
-    # Scale the cached screenshot to the requested width.
+
     def scaledToWidth(self, width, mode=None):
         pm = self._pixmap()
         try:
@@ -99,7 +99,7 @@ class Kotor2SaveGame(BasicGameSaveGame):
         except Exception:
             return pm
 
-    # Scale the cached screenshot to the requested height.
+
     def scaledToHeight(self, height, mode=None):
         pm = self._pixmap()
         try:
@@ -108,7 +108,7 @@ class Kotor2SaveGame(BasicGameSaveGame):
             return pm
 
 
-# Build the extra metadata shown for a save entry.
+
 def parse_kotor2_save_metadata(save_path: Path, save: mobase.ISaveGame):
     files = [f.name for f in save_path.glob("*")]
     return {

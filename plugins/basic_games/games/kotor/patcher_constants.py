@@ -1,0 +1,23 @@
+from PyQt6.QtCore import Qt
+
+COL_ENABLED = 0
+COL_CONFLICTS = 1
+COL_MOD = 2
+COL_PATCH = 3
+COL_DESCRIPTION = 4
+COL_PRIORITY = 5
+PATCHER_TREE_COLUMN_COUNT = 6
+
+ROLE_INI_PATH = Qt.ItemDataRole.UserRole
+ROLE_DESTINATION = Qt.ItemDataRole.UserRole + 1
+ROLE_INSTALL_PATHS = Qt.ItemDataRole.UserRole + 2
+ROLE_REQUIRED = Qt.ItemDataRole.UserRole + 3
+ROLE_FILES = Qt.ItemDataRole.UserRole + 4
+ROLE_OVERVIEW_COLOR = Qt.ItemDataRole.UserRole + 5
+ROLE_CONFLICT_SORT = Qt.ItemDataRole.UserRole + 6
+
+PATCHER_CONFLICT_MIXED = "mixed"
+PATCHER_CONFLICT_OVERWRITE = "overwrite"
+PATCHER_CONFLICT_OVERWRITTEN = "overwritten"
+PATCHER_CONFLICT_INFORMATIONAL = "informational"
+MO2_MOD_INDEX_ROLE = Qt.ItemDataRole.UserRole.value + 1

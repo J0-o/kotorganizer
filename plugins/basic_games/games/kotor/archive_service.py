@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -123,12 +124,43 @@ class ArchiveService:
             for path in (self._downloads_path / cleaned, self._downloads_path / f"{cleaned}.zip"):
                 if path.exists():
                     return path
+            duplicate_path = self.resolve_duplicate_named_archive_path(cleaned)
+            if duplicate_path is not None:
+                return duplicate_path
         expected_archive_name = next((str(name).strip() for name in archive_names if str(name).strip()), "")
         if self.is_tslrcm_expected_archive_name(expected_archive_name):
             converted_path = self.convert_matching_tslrcm_installer(expected_archive_name)
             if converted_path is not None and converted_path.exists():
                 return converted_path
         return None
+
+    def resolve_duplicate_named_archive_path(self, archive_name: str) -> Path | None:
+        candidates = self.resolve_duplicate_named_archive_paths(archive_name)
+        return candidates[0] if candidates else None
+
+    def resolve_duplicate_named_archive_paths(self, archive_name: str) -> list[Path]:
+        cleaned = html.unescape(str(archive_name or "")).strip().strip('"').strip("'")
+        if not cleaned:
+            return []
+        try:
+            candidates = [
+                path for path in self._downloads_path.iterdir()
+                if path.is_file() and self.archive_name_matches(path, cleaned)
+            ]
+        except Exception:
+            return []
+        return sorted(
+            candidates,
+            key=lambda path: (self._path_mtime(path), path.name.casefold()),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _path_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
 
     def resolve_archive_path_by_hash(self, expected_hash: str, hash_cache: dict[Path, str] | None = None) -> Path | None:
         if not expected_hash:
@@ -244,11 +276,19 @@ class ArchiveService:
     def detect_browser_download(self, expected_path: Path, existing_names: set[str]) -> Path | None:
         if (
             expected_path.name
+            and expected_path.name not in existing_names
             and expected_path.is_file()
             and not self.is_incomplete_download_name(expected_path.name)
             and not (expected_path.parent / f"{expected_path.name}.crdownload").exists()
         ):
             return expected_path
+        for duplicate_path in self.resolve_duplicate_named_archive_paths(expected_path.name):
+            if (
+                duplicate_path.name not in existing_names
+                and not self.is_incomplete_download_name(duplicate_path.name)
+                and not (duplicate_path.parent / f"{duplicate_path.name}.crdownload").exists()
+            ):
+                return duplicate_path
         return self.detect_new_download(existing_names)
 
     def detect_new_download(self, existing_names: set[str]) -> Path | None:
@@ -376,7 +416,25 @@ class ArchiveService:
         cleaned = html.unescape(str(archive_name or "")).strip().strip('"').strip("'")
         if not cleaned:
             return False
-        return archive_path.name in {cleaned, f"{cleaned}.zip"}
+        return any(
+            ArchiveService._archive_filename_matches(archive_path.name, candidate)
+            for candidate in (cleaned, f"{cleaned}.zip")
+        )
+
+    @staticmethod
+    def _archive_filename_matches(actual_name: str, expected_name: str) -> bool:
+        actual = Path(actual_name)
+        expected = Path(expected_name)
+        if actual.name.casefold() == expected.name.casefold():
+            return True
+        if actual.suffix.casefold() != expected.suffix.casefold():
+            return False
+        actual_stem = actual.stem.casefold()
+        expected_stem = expected.stem.casefold()
+        if not actual_stem.startswith(expected_stem):
+            return False
+        extra = actual_stem[len(expected_stem):]
+        return bool(re.match(r"^(?:\s*\(\d+\)|[\s._-].+)$", extra))
 
     @staticmethod
     def kson_mod_name(mod) -> str:

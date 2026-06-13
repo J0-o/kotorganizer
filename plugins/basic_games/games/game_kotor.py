@@ -45,9 +45,9 @@ class KotorModDataChecker(KotorModDataCheckerBase):
     pass
 
 
-# Implement the MO2 game plugin for KOTOR.
+
 class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
-    # Initialize plugin state and custom tabs.
+
     def __init__(self):
         BasicGame.__init__(self)
         mobase.IPluginFileMapper.__init__(self)
@@ -59,7 +59,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
 
     Name = "STAR WARS Knights of the Old Republic"
     Author = "J"
-    Version = "2.2.0"
+    Version = "2.2.6"
 
     GameName = Name
     GameShortName = "kotor"
@@ -77,7 +77,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
         "Steam Workshop content detected for KOTOR. Workshop mods are unsupported in Mod Organizer 2."
     )
 
-    # Register MO2 features and create required game folders.
+
     def init(self, organizer: mobase.IOrganizer) -> bool:
         super().init(organizer)
         self._organizer = organizer
@@ -86,7 +86,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
         self._register_feature(BasicGameSaveGameInfo(KotorSaveGame, parse_kotor_save_metadata))
         self._register_feature(KotorModDataChecker())
         organizer.onUserInterfaceInitialized(self._init_custom_tabs)
-        organizer.onAboutToRun(lambda app: self._log_platform_once())
+        organizer.onAboutToRun(self._before_run)
 
         try:
             mg = self._organizer.managedGame()
@@ -101,15 +101,15 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
 
         return True
 
-    # Insert the custom saves, textures, and patcher tabs into MO2.
+
     def _init_custom_tabs(self, main_window: QMainWindow):
         self._init_custom_tabs_common(main_window)
 
-    # Return the INI files associated with the game.
+
     def iniFiles(self):
         return [self.gameDirectory().absoluteFilePath("swkotor.ini")]
 
-    # Return the main executable registered for launch.
+
     def executables(self):
         self._log_platform_once()
         exe_path = self.gameDirectory().absoluteFilePath(self.binaryName())
@@ -118,7 +118,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
             mobase.ExecutableInfo("KOTOR", exe_path),
         ]
 
-    # Enumerate save directories visible to MO2.
+
     def listSaves(self, folder: QDir) -> list[mobase.ISaveGame]:
         saves = []
         root = Path(folder.absolutePath())
@@ -128,6 +128,6 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
         return saves
 
 
-# Construct the MO2 plugin instance.
+
 def createPlugin() -> mobase.IPluginGame:
     return StarWarsKotorGame()

@@ -22,7 +22,7 @@ from basic_games.basic_features import BasicModDataChecker, GlobPatterns
 from basic_games.basic_features.utils import is_directory
 
 
-# Check and fix KOTOR mod archive layouts.
+
 class KotorModDataCheckerBase(BasicModDataChecker):
     _valid_map = {
         "override": (
@@ -51,25 +51,25 @@ class KotorModDataCheckerBase(BasicModDataChecker):
 
     _restricted_dirs = {"data"}
 
-    # Create the checker with valid extensions.
+
     def __init__(self):
         all_exts = tuple(ext for exts in self._valid_map.values() for ext in exts)
         self._all_valid_exts = {ext.lower() for ext in all_exts}
         super().__init__(GlobPatterns(all_exts))
 
-    # Yield all directories below a node.
+
     def _iter_dirs(self, node):
         for entry in list(node):
             if is_directory(entry):
                 yield entry
                 yield from self._iter_dirs(entry)
 
-    # Find directories with a matching name.
+
     def _find_dirs_named(self, node, name_lower: str):
         name_lower = name_lower.lower()
         return [directory for directory in self._iter_dirs(node) if directory.name().lower() == name_lower]
 
-    # Find one file or directory by relative path below a tree node.
+
     def _find_entry_by_relpath(self, node, relpath: str):
         parts = [part for part in relpath.replace("\\", "/").split("/") if part]
         if not parts:
@@ -86,11 +86,11 @@ class KotorModDataCheckerBase(BasicModDataChecker):
             current = match
         return None
 
-    # Check for ignored source folders.
+
     def _is_ignored_source_dir_name(self, name: str) -> bool:
         return name.lower().startswith("source")
 
-    # Check whether a file is a KOTOR mod file.
+
     def _is_valid_mod_file(self, file_node) -> bool:
         if is_directory(file_node):
             return False
@@ -102,7 +102,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
             return False
         return ext in self._all_valid_exts
 
-    # Remove invalid root entries.
+
     def _cleanup_root(self, filetree: mobase.IFileTree):
         valid_top = set(self._valid_map.keys()) | {"dialog.tlk", "override", "tslpatchdata"}
         ignored = self._ignored_exts
@@ -130,7 +130,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
             if ext in ignored or ext not in valid_exts:
                 child.detach()
 
-    # Check whether the mod data layout is valid.
+
     def dataLooksValid(self, filetree: mobase.IFileTree) -> mobase.ModDataChecker.CheckReturn:
         tsl_dirs = self._find_dirs_named(filetree, "tslpatchdata")
         if tsl_dirs:
@@ -142,7 +142,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
 
         ignored = self._ignored_exts
 
-        # Check whether a node is under a valid folder.
+
         def parent_has_valid_dir(node) -> bool:
             parent = node.parent()
             while parent is not None and parent != filetree:
@@ -217,12 +217,12 @@ class KotorModDataCheckerBase(BasicModDataChecker):
 
         return mobase.ModDataChecker.INVALID
 
-    # Fix the mod data layout when possible.
+
     def fix(self, filetree: mobase.IFileTree) -> mobase.IFileTree | None:
         tsl_dirs = self._find_dirs_named(filetree, "tslpatchdata")
         valid_dirs = []
 
-        # Build a display path for a tree node.
+
         def _display_path(node: mobase.IFileTree) -> str:
             parts = [node.name()]
             parent = node.parent()
@@ -232,7 +232,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
             parts.reverse()
             return "/".join(parts)
 
-        # Check whether a node is under tslpatchdata.
+
         def _is_under_tslpatchdata(node: mobase.IFileTree) -> bool:
             parent = node.parent()
             while parent is not None:
@@ -241,7 +241,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                 parent = parent.parent()
             return False
 
-        # Check whether a node is under a source folder.
+
         def _is_ignored_source_dir(node: mobase.IFileTree) -> bool:
             parent = node.parent()
             while parent is not None:
@@ -250,11 +250,11 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                 parent = parent.parent()
             return self._is_ignored_source_dir_name(node.name())
 
-        # Check for direct valid mod files.
+
         def _directory_has_direct_valid_mod_file(node: mobase.IFileTree) -> bool:
             return any(self._is_valid_mod_file(child) for child in list(node) if not is_directory(child))
 
-        # Check for valid mod files below a directory.
+
         def _directory_contains_valid_mod_file(node: mobase.IFileTree) -> bool:
             for child in list(node):
                 if is_directory(child):
@@ -271,7 +271,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                     return True
             return False
 
-        # Check for a valid child source directory.
+
         def _has_qualifying_child_directory(node: mobase.IFileTree) -> bool:
             for child in list(node):
                 if not is_directory(child):
@@ -286,7 +286,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                     return True
             return False
 
-        # Move valid files into Override.
+
         def _move_valid_files_to_override(node: mobase.IFileTree):
             for child in list(node):
                 if is_directory(child):
@@ -311,7 +311,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                             existing.detach()
                         filetree.move(child, destination)
 
-        # Yield valid file moves for one loose source.
+
         def _iter_valid_loose_moves(node: mobase.IFileTree | None):
             if node is None:
                 for file_node in loose_valid:
@@ -401,7 +401,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                 loose_options.append(name)
                 loose_mapping[name] = directory
 
-            # Ask the user which source to install.
+
             def _choose_install_sources(
                 tsl_labels: list[str], loose_labels: list[str]
             ) -> tuple[str | None, list[str], bool]:
@@ -480,12 +480,12 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                 loose_layout.addLayout(controls)
                 content_row.addWidget(loose_panel, 1)
 
-                # Set all loose-source checks.
+
                 def _set_loose_checks(state: Qt.CheckState):
                     for i in range(location_list.count()):
                         location_list.item(i).setCheckState(state)
 
-                # Disable loose sources when TSLPatcher is selected.
+
                 def _sync_from_tsl():
                     tsl_selected = any(button.isChecked() and button is not none_button for button in tsl_buttons)
                     location_list.setEnabled(not tsl_selected and bool(loose_labels))
@@ -494,7 +494,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
                     if tsl_selected:
                         _set_loose_checks(Qt.CheckState.Unchecked)
 
-                # Disable TSLPatcher when loose sources are selected.
+
                 def _sync_from_loose(item: QListWidgetItem):
                     if item.checkState() == Qt.CheckState.Checked:
                         for button in tsl_buttons:
@@ -579,7 +579,7 @@ class KotorModDataCheckerBase(BasicModDataChecker):
             if not self._find_dirs_named(filetree, "override"):
                 filetree.addDirectory("override")
 
-            # Move all files from a single root folder.
+
             def _move_files_only(node: mobase.IFileTree):
                 for child in list(node):
                     if is_directory(child):
