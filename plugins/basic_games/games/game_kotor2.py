@@ -57,7 +57,7 @@ class StarWarsKotor2Game(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
 
     Name = "STAR WARS Knights of the Old Republic II The Sith Lords"
     Author = "J"
-    Version = "2.2.6"
+    Version = "2.6.7"
 
     GameName = Name
     GameShortName = "kotor2"

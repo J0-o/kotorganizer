@@ -34,6 +34,7 @@ def install_kson_build(
     mods_path: Path,
     profile_path: Path,
     progress=None,
+    cancelled=None,
 ) -> SyncInstallResult:
     payload = json.loads(kson_path.read_text(encoding="utf-8"))
     mods = sorted(
@@ -45,12 +46,16 @@ def install_kson_build(
     preserved_mods, old_mods_path = _move_existing_mods(mods_path, warnings)
     total = len(mods)
     for index, mod in enumerate(mods, start=1):
+        if cancelled and cancelled():
+            raise RuntimeError("Sync stopped.")
         mod_name = str(mod.get("mod_name") or "").strip()
         if not mod_name:
             continue
         if progress:
             progress(index, total, mod_name, "Preparing mod folder")
         _install_mod(mod, downloads_path, mods_path, warnings, progress, index, total)
+        if cancelled and cancelled():
+            raise RuntimeError("Sync stopped.")
 
 
 

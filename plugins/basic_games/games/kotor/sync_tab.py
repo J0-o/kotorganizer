@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import mobase
 from PyQt6.QtCore import QPoint, QProcess, Qt, QThread, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QBrush, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -46,8 +46,10 @@ from ui_theme import (
     configure_download_button,
     configure_refresh_button,
     configure_tree_widget,
+    mo2_archive_conflict_purple,
     refresh_mo2,
     set_header_resize_mode,
+    tree_conflict_row_color,
     tree_row_padding_stylesheet,
 )
 
@@ -112,6 +114,7 @@ class Kotor2SyncTab(QWidget):
         self._sync_progress_lines: list[str] = []
         self._sync_busy = False
         self._validated_for_sync = False
+        self._download_missing_available = False
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -122,6 +125,7 @@ class Kotor2SyncTab(QWidget):
         self._refresh_btn.clicked.connect(self._refresh_fetch_validate)
         self._download_btn = QPushButton("Download Missing")
         configure_download_button(self._download_btn)
+        self._set_download_missing_available(False)
         self._download_btn.clicked.connect(self._download_missing_archives)
         self._stop_download_btn = QPushButton("Stop")
         self._stop_download_btn.setEnabled(False)
@@ -175,7 +179,9 @@ class Kotor2SyncTab(QWidget):
     def _refresh_fetch_validate(self):
         if self._fetch_thread is not None or self._validation_thread is not None:
             return
+        self._set_download_missing_available(False)
         self.refresh()
+        QTimer.singleShot(0, self._refresh_sync_skip_row_styles)
         self._start_fetch_latest_manifest()
 
 
@@ -245,6 +251,7 @@ class Kotor2SyncTab(QWidget):
             row.setData(1, Qt.ItemDataRole.UserRole + 10, int(priority) if str(priority).lstrip("-").isdigit() else -1)
             row.setData(8, Qt.ItemDataRole.UserRole + 10, len(archive_files) if isinstance(archive_files, list) else -1)
             row.setData(9, Qt.ItemDataRole.UserRole + 10, len(actions) if isinstance(actions, list) else -1)
+            self._apply_sync_skip_row_style(row, skipped)
             row.setData(
                 0,
                 Qt.ItemDataRole.UserRole,
@@ -267,6 +274,7 @@ class Kotor2SyncTab(QWidget):
         if self._tree.topLevelItemCount():
             self._tree.setCurrentItem(self._tree.topLevelItem(0))
         self._summary_label.setText(f"{self._tree.topLevelItemCount()} mods")
+        QTimer.singleShot(0, self._refresh_sync_skip_row_styles)
         self._update_details()
 
 
@@ -288,10 +296,12 @@ class Kotor2SyncTab(QWidget):
                 continue
             archive_name = self._expected_archive_name(mod)
             url = str(mod.get("url") or "").strip()
-            if archive_name and row.text(0) not in {"Hash OK", "Empty OK"}:
+            if not self._row_needs_missing_download(row):
+                continue
+            if archive_name:
                 self._download_queue.append((row, mod))
                 continue
-            if not archive_name and url and row.text(0) not in {"Hash OK", "Empty OK"}:
+            if url:
                 self._download_queue.append((row, mod))
 
         if not self._download_queue:
@@ -307,7 +317,7 @@ class Kotor2SyncTab(QWidget):
 
     def _process_next_download(self):
         if not self._download_queue:
-            self._download_btn.setEnabled(True)
+            self._set_download_missing_available(self._has_missing_download_rows())
             self._stop_download_btn.setEnabled(False)
             self._summary_label.setText("Download queue complete")
             self._details.appendPlainText("\nDownload queue complete.")
@@ -400,7 +410,7 @@ class Kotor2SyncTab(QWidget):
                 cancel_row, cancel_mod, existing_names = context
                 self._cleanup_download_artifacts(existing_names)
                 self._mark_download_stopped(cancel_row, cancel_mod, "DeadlyScraper download stopped and cleaned up.")
-            self._download_btn.setEnabled(True)
+            self._download_btn.setEnabled(self._download_missing_available)
             self._stop_download_btn.setEnabled(False)
             return
         existing_names = context[2] if context is not None else set()
@@ -616,6 +626,25 @@ class Kotor2SyncTab(QWidget):
 
     def _stop_downloads(self):
         self._download_queue = []
+        self._download_validation_continue_pending = False
+        if self._validation_worker is not None:
+            self._validation_worker.cancel()
+            self._stop_download_btn.setEnabled(False)
+            self._summary_label.setText("Stopping validation...")
+            self._details.appendPlainText("\nStopping validation after the current archive...")
+            return
+        if self._download_validation_worker is not None:
+            self._download_validation_worker.cancel()
+            self._stop_download_btn.setEnabled(False)
+            self._summary_label.setText("Stopping hash...")
+            self._details.appendPlainText("\nStopping hash after the current archive...")
+            return
+        if self._sync_worker is not None:
+            self._sync_worker.cancel()
+            self._stop_download_btn.setEnabled(False)
+            self._summary_label.setText("Stopping sync...")
+            self._details.appendPlainText("\nStopping sync after the current mod...")
+            return
         if self._download_process is not None:
             self._download_cancel_requested = True
             self._stop_download_btn.setEnabled(False)
@@ -629,7 +658,7 @@ class Kotor2SyncTab(QWidget):
             self._close_browser_process()
             self._cleanup_download_artifacts(existing_names)
             self._mark_download_stopped(row, mod, "Browser download stopped and cleaned up.")
-        self._download_btn.setEnabled(True)
+        self._download_btn.setEnabled(self._download_missing_available)
         self._stop_download_btn.setEnabled(False)
 
     def _cleanup_download_artifacts(self, existing_names: set[str]):
@@ -736,6 +765,11 @@ class Kotor2SyncTab(QWidget):
         if context is None:
             return
         row, mod, archive_path, _result, continue_queue = context
+        if "stopped" in message.lower():
+            self._mark_download_stopped(row, mod, message)
+            self._download_validation_continue_pending = False
+            self._download_queue = []
+            return
         self._set_validation_row(
             row,
             "Hash Fail",
@@ -756,6 +790,8 @@ class Kotor2SyncTab(QWidget):
         self._download_validation_context = None
         continue_pending = self._download_validation_continue_pending
         self._download_validation_continue_pending = False
+        if not continue_pending and self._download_process is None and self._browser_waiting is None:
+            self._stop_download_btn.setEnabled(False)
         if continue_pending:
             QTimer.singleShot(self._DOWNLOAD_QUEUE_DELAY_MS, self._process_next_download)
 
@@ -866,6 +902,7 @@ class Kotor2SyncTab(QWidget):
         self._tree.addTopLevelItem(row)
         self._tree.setCurrentItem(row)
         self._summary_label.setText("0 mods")
+        self._set_download_missing_available(False)
         self._update_details()
 
 
@@ -874,7 +911,7 @@ class Kotor2SyncTab(QWidget):
         self._fetch_worker = None
         if self._validation_thread is None:
             self._refresh_btn.setEnabled(True)
-            self._download_btn.setEnabled(True)
+            self._download_btn.setEnabled(self._download_missing_available)
         self._update_sync_button_state()
 
 
@@ -1049,6 +1086,7 @@ class Kotor2SyncTab(QWidget):
         self._validation_worker = worker
         self._refresh_btn.setEnabled(False)
         self._download_btn.setEnabled(False)
+        self._stop_download_btn.setEnabled(True)
         self._sync_btn.setEnabled(False)
         self._summary_label.setText(f"Validating 0/{len(validation_rows)}")
         self._details.setPlainText("Validating downloaded archives...")
@@ -1080,30 +1118,36 @@ class Kotor2SyncTab(QWidget):
 
     def _finish_archive_validation(self, counts: dict):
         self._restore_validation_sorting()
+        user_skipped = self._user_skipped_row_count()
+        total_skipped = counts["skipped"] + user_skipped
         self._summary_label.setText(
             f"{counts['ok']} ok | {counts['empty']} empty | {counts['missing']} missing | "
-            f"{counts['mismatch']} mismatch | {counts['skipped']} skipped"
+            f"{counts['mismatch']} mismatch | {total_skipped} skipped"
         )
         if counts["missing"] or counts["mismatch"] or counts["skipped"]:
             _log_warning(
                 f"Archive validation needs attention: {counts['ok']} ok, {counts['empty']} empty, "
-                f"{counts['missing']} missing, {counts['mismatch']} mismatch, {counts['skipped']} skipped."
+                f"{counts['missing']} missing, {counts['mismatch']} mismatch, {counts['skipped']} validation skipped, "
+                f"{user_skipped} user skipped."
             )
         else:
-            _log_info(f"Archive validation passed: {counts['ok']} ok, {counts['empty']} empty.")
+            _log_info(f"Archive validation passed: {counts['ok']} ok, {counts['empty']} empty, {user_skipped} user skipped.")
         if counts["missing"] == 0 and counts["mismatch"] == 0 and counts["skipped"] == 0:
             self._refresh_validated_for_current_rows()
         else:
             self._validated_for_sync = False
+        self._set_download_missing_available(self._has_missing_download_rows())
         self._update_sync_button_state()
         self._update_details()
 
     def _fail_archive_validation(self, message: str):
         self._restore_validation_sorting()
         self._validated_for_sync = False
-        self._summary_label.setText("Validation failed")
-        self._details.setPlainText(f"Archive validation failed:\n{message}")
-        _log_warning(f"Archive validation failed: {message}")
+        stopped = "stopped" in message.lower()
+        self._summary_label.setText("Validation stopped" if stopped else "Validation failed")
+        self._details.setPlainText(message if stopped else f"Archive validation failed:\n{message}")
+        _log_warning(f"Archive validation {'stopped' if stopped else 'failed'}: {message}")
+        self._set_download_missing_available(False if stopped else self._has_missing_download_rows())
         self._update_sync_button_state()
 
     def _restore_validation_sorting(self):
@@ -1118,7 +1162,8 @@ class Kotor2SyncTab(QWidget):
         self._validation_worker = None
         if self._fetch_thread is None:
             self._refresh_btn.setEnabled(True)
-            self._download_btn.setEnabled(True)
+            self._download_btn.setEnabled(self._download_missing_available)
+        self._stop_download_btn.setEnabled(False)
         self._update_sync_button_state()
 
 
@@ -1169,6 +1214,7 @@ class Kotor2SyncTab(QWidget):
         self._sync_progress_lines = []
         self._sync_busy = True
         self._update_sync_button_state()
+        self._stop_download_btn.setEnabled(True)
         self._details.setPlainText("Starting sync...")
         _log_info("Sync started.")
         thread.start()
@@ -1193,10 +1239,12 @@ class Kotor2SyncTab(QWidget):
         QTimer.singleShot(750, self._run_post_sync_steps)
 
     def _fail_sync(self, message: str):
-        self._details.setPlainText(f"Sync failed:\n{message}")
-        self._summary_label.setText("Sync failed")
-        _log_warning(f"Sync failed: {message}")
+        stopped = "stopped" in message.lower()
+        self._details.setPlainText(message if stopped else f"Sync failed:\n{message}")
+        self._summary_label.setText("Sync stopped" if stopped else "Sync failed")
+        _log_warning(f"Sync {'stopped' if stopped else 'failed'}: {message}")
         self._sync_busy = False
+        self._stop_download_btn.setEnabled(False)
         self._update_sync_button_state()
         refresh_mo2(self._organizer, self)
 
@@ -1209,6 +1257,7 @@ class Kotor2SyncTab(QWidget):
             except Exception:
                 pass
             self._sync_temp_kson_path = None
+        self._stop_download_btn.setEnabled(False)
         self._update_sync_button_state()
 
 
@@ -1245,6 +1294,26 @@ class Kotor2SyncTab(QWidget):
             and self._fetch_thread is None
             and self._validation_thread is None
         )
+
+    def _set_download_missing_available(self, available: bool):
+        self._download_missing_available = available
+        self._download_btn.setEnabled(available)
+
+    def _has_missing_download_rows(self) -> bool:
+        return any(
+            self._row_needs_missing_download(self._tree.topLevelItem(index))
+            for index in range(self._tree.topLevelItemCount())
+        )
+
+    def _row_needs_missing_download(self, row: QTreeWidgetItem) -> bool:
+        if self._row_is_sync_skipped(row):
+            return False
+        if row.text(0) not in {"Missing", "Hash Miss", "Hash Fail", "Download Fail", "Failed", "Pending", "Stopped"}:
+            return False
+        mod = row.data(0, Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(mod, dict):
+            return False
+        return bool(self._expected_archive_name(mod) or str(mod.get("url") or "").strip())
 
 
     def _run_texture_auto_fix_after_sync(self):
@@ -1308,6 +1377,16 @@ class Kotor2SyncTab(QWidget):
     def _row_is_sync_skipped(self, row: QTreeWidgetItem) -> bool:
         return bool(row.data(0, Qt.ItemDataRole.UserRole + 2))
 
+    def _apply_sync_skip_row_style(self, row: QTreeWidgetItem, skipped: bool):
+        brush = QBrush(tree_conflict_row_color(self._tree, mo2_archive_conflict_purple())) if skipped else QBrush()
+        for column in range(self._tree.columnCount()):
+            row.setBackground(column, brush)
+
+    def _refresh_sync_skip_row_styles(self):
+        for index in range(self._tree.topLevelItemCount()):
+            row = self._tree.topLevelItem(index)
+            self._apply_sync_skip_row_style(row, self._row_is_sync_skipped(row))
+
     def _set_row_sync_skipped(self, row: QTreeWidgetItem, mod: dict, skipped: bool):
         row.setData(0, Qt.ItemDataRole.UserRole + 2, skipped)
         if skipped:
@@ -1326,8 +1405,11 @@ class Kotor2SyncTab(QWidget):
             mod.pop("_sync_skip", None)
             row.setText(0, "Ready")
             self._update_row_sync_details(row, mod)
+        self._apply_sync_skip_row_style(row, skipped)
+        self._write_persisted_sync_skip(mod, skipped)
         self._write_cached_kson_mod_update(mod)
         self._refresh_validated_for_current_rows()
+        self._set_download_missing_available(self._download_missing_available and self._has_missing_download_rows())
         self._update_sync_button_state()
         if self._tree.currentItem() is row:
             self._update_details()
@@ -1357,6 +1439,13 @@ class Kotor2SyncTab(QWidget):
                 self._validated_for_sync = False
                 return
         self._validated_for_sync = has_included
+
+    def _user_skipped_row_count(self) -> int:
+        return sum(
+            1
+            for index in range(self._tree.topLevelItemCount())
+            if self._row_is_sync_skipped(self._tree.topLevelItem(index))
+        )
 
     def _write_sync_kson_for_current_rows(self, source_path: Path) -> Path | None:
         try:
@@ -1414,6 +1503,10 @@ class Kotor2SyncTab(QWidget):
 
     def _cache_path(self) -> Path:
         return self._kson_dir() / f"{self._build_key()}_latest_build.kson"
+
+
+    def _sync_skip_state_path(self) -> Path:
+        return Path(self._organizer.profilePath()) / f"{self._build_key()}_sync_skips.json"
 
 
     def _cached_kson_version_text(self) -> str:
@@ -1822,9 +1915,102 @@ class Kotor2SyncTab(QWidget):
         if not cache_path.exists():
             return None
         try:
-            return json.loads(cache_path.read_text(encoding="utf-8"))
+            kson = json.loads(cache_path.read_text(encoding="utf-8"))
         except Exception:
             return None
+        if not isinstance(kson, dict):
+            return None
+        self._apply_persisted_sync_skips(kson)
+        return kson
+
+
+    def _read_persisted_sync_skips(self) -> dict:
+        path = self._sync_skip_state_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        skipped = payload.get("skipped", {}) if isinstance(payload, dict) else {}
+        return skipped if isinstance(skipped, dict) else {}
+
+
+    def _write_persisted_sync_skip(self, mod: dict, skipped: bool):
+        keys = self._sync_skip_keys(mod)
+        if not keys:
+            return
+        skipped_mods = self._read_persisted_sync_skips()
+        if skipped:
+            entry = {
+                "mod_name": self._kson_mod_name(mod),
+                "priority": str(mod.get("priority") or "").strip(),
+                "url": str(mod.get("url") or "").strip(),
+                "archive_name": self._expected_archive_name(mod),
+            }
+            for key in keys:
+                skipped_mods[key] = entry
+        else:
+            mod_name = self._kson_mod_name(mod).casefold()
+            for key in list(skipped_mods):
+                value = skipped_mods.get(key)
+                value_name = str(value.get("mod_name") or "").strip().casefold() if isinstance(value, dict) else ""
+                if key in keys or (mod_name and value_name == mod_name):
+                    skipped_mods.pop(key, None)
+
+        payload = {
+            "version": 1,
+            "game": self._build_key(),
+            "skipped": skipped_mods,
+        }
+        try:
+            path = self._sync_skip_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _log_warning(f"Failed to persist sync skip state: {exc}")
+
+
+    def _apply_persisted_sync_skips(self, kson: dict):
+        mods = kson.get("mods", [])
+        if not isinstance(mods, list):
+            return
+        skipped_mods = self._read_persisted_sync_skips()
+        if not skipped_mods:
+            return
+        skipped_keys = set(skipped_mods)
+        for mod in mods:
+            if not isinstance(mod, dict):
+                continue
+            if self._sync_skip_keys(mod) & skipped_keys:
+                mod["_sync_skip"] = True
+            else:
+                mod.pop("_sync_skip", None)
+
+
+    def _sync_skip_keys(self, mod: dict) -> set[str]:
+        mod_name = self._kson_mod_name(mod).casefold()
+        if not mod_name:
+            return set()
+        keys = {f"{mod_name}|name"}
+        url = str(mod.get("url") or "").strip().casefold()
+        if url:
+            keys.add(f"{mod_name}|url:{url}")
+        archive_name = self._expected_archive_name(mod).casefold()
+        if archive_name:
+            keys.add(f"{mod_name}|archive:{archive_name}")
+        legacy_key = self._sync_skip_legacy_key(mod)
+        if legacy_key:
+            keys.add(legacy_key)
+        return keys
+
+
+    def _sync_skip_legacy_key(self, mod: dict) -> str:
+        mod_name = self._kson_mod_name(mod).casefold()
+        if not mod_name:
+            return ""
+        priority = str(mod.get("priority") or "").strip()
+        return f"{mod_name}|priority:{priority}"
 
 
     @staticmethod

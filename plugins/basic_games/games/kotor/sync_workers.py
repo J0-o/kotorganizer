@@ -176,6 +176,11 @@ class _SyncWorker(QObject):
         self._downloads_path = downloads_path
         self._mods_path = mods_path
         self._profile_path = profile_path
+        self._cancel_requested = False
+
+
+    def cancel(self):
+        self._cancel_requested = True
 
 
     def run(self):
@@ -186,6 +191,7 @@ class _SyncWorker(QObject):
                 self._mods_path,
                 self._profile_path,
                 progress=self.progress.emit,
+                cancelled=lambda: self._cancel_requested,
             )
             self.finished.emit(result)
         except Exception as exc:
@@ -204,6 +210,11 @@ class _ValidationWorker(QObject):
         self._downloads_path = downloads_path
         self._kson = kson
         self._row_specs = row_specs
+        self._cancel_requested = False
+
+
+    def cancel(self):
+        self._cancel_requested = True
 
 
     def run(self):
@@ -224,6 +235,9 @@ class _ValidationWorker(QObject):
             total = len(self._row_specs)
 
             for current, spec in enumerate(self._row_specs, start=1):
+                if self._cancel_requested:
+                    self.failed.emit("Validation stopped.")
+                    return
                 mod = spec.get("mod")
                 if not isinstance(mod, dict):
                     matches = mods_by_name.get(str(spec.get("mod_name") or ""), [])
@@ -241,6 +255,9 @@ class _ValidationWorker(QObject):
                     )
                 else:
                     result = runner.validate_mod(mod, hash_cache=hash_cache)
+                if self._cancel_requested:
+                    self.failed.emit("Validation stopped.")
+                    return
                 counts[str(result.get("bucket") or "skipped")] += 1
                 self.progress.emit(current, total, int(spec.get("row_index", current - 1)), result)
 
@@ -259,16 +276,29 @@ class _DownloadedValidationWorker(QObject):
         self._cache_path = cache_path
         self._mod = mod
         self._archive_path = archive_path
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
 
     def run(self):
         try:
+            if self._cancel_requested:
+                self.failed.emit("Download validation stopped.")
+                return
             service = ArchiveService(self._downloads_path, self._cache_path)
             archive_path, wrap_result = self._wrap_loose_download(service, self._archive_path, service.expected_archive_name(self._mod))
+            if self._cancel_requested:
+                self.failed.emit("Download validation stopped.")
+                return
             result = service.validate_archive_path(
                 self._mod,
                 archive_path,
                 allow_content_hash=True,
             )
+            if self._cancel_requested:
+                self.failed.emit("Download validation stopped.")
+                return
             self.finished.emit({"archive_path": str(archive_path), "wrap_result": wrap_result, "validation": result})
         except Exception as exc:
             self.failed.emit(str(exc))
