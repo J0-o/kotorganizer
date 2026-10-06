@@ -1,13 +1,17 @@
+import ctypes
 import html
 import logging
+import mmap
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
 from hash_utils import file_hash
+from py7z import ArchiveReader
 
 
 logger = logging.getLogger("mobase")
@@ -224,54 +228,19 @@ class ArchiveService:
         return True, "Archive hash mismatched, but all archived file hashes match the KSON contents."
 
     def archive_member_hashes(self, archive_path: Path) -> tuple[dict[str, str], str]:
-        seven_zip = self.seven_zip_exe()
-        if seven_zip:
-            try:
-                with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_hash_") as temp_dir:
-                    extract_root = Path(temp_dir) / "extract"
-                    extract_root.mkdir(parents=True, exist_ok=True)
-                    result = subprocess.run(
-                        [seven_zip, "x", "-y", f"-o{extract_root}", str(archive_path)],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        check=False,
-                        startupinfo=self.subprocess_startupinfo(),
-                        creationflags=self.subprocess_creationflags(),
-                    )
-                    if result.returncode != 0:
-                        detail = (result.stderr or result.stdout or "").strip()
-                        return {}, detail or f"7-Zip extraction failed with exit code {result.returncode}"
-                    return (
-                        {
-                            path.relative_to(extract_root).as_posix(): file_hash(path).lower()
-                            for path in sorted(extract_root.rglob("*"))
-                            if path.is_file()
-                        },
-                        "",
-                    )
-            except Exception as exc:
-                return {}, str(exc)
-
-        if archive_path.suffix.lower() != ".zip":
-            return {}, "7-Zip is unavailable for non-ZIP archive comparison"
-        try:
-            with zipfile.ZipFile(archive_path) as archive:
-                with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_hash_") as temp_dir:
-                    extract_root = Path(temp_dir) / "extract"
-                    extract_root.mkdir(parents=True, exist_ok=True)
-                    archive.extractall(extract_root)
-                    return (
-                        {
-                            path.relative_to(extract_root).as_posix(): file_hash(path).lower()
-                            for path in sorted(extract_root.rglob("*"))
-                            if path.is_file()
-                        },
-                        "",
-                    )
-        except Exception as exc:
-            return {}, str(exc)
+        with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_hash_") as temp_dir:
+            extract_root = Path(temp_dir) / "extract"
+            extraction_error = self.extract_archive(archive_path, extract_root)
+            if extraction_error:
+                return {}, extraction_error
+            return (
+                {
+                    path.relative_to(extract_root).as_posix(): file_hash(path).lower()
+                    for path in sorted(extract_root.rglob("*"))
+                    if path.is_file()
+                },
+                "",
+            )
 
     def detect_browser_download(self, expected_path: Path, existing_names: set[str]) -> Path | None:
         if (
@@ -337,6 +306,8 @@ class ArchiveService:
         if not script_path.exists():
             raise RuntimeError(f"Missing converter script: {script_path}")
         with tempfile.TemporaryDirectory(prefix="kotorganizer_tslrcm_") as temp_dir:
+            prepared_path = Path(temp_dir) / "payload.lzma"
+            expanded_path = Path(temp_dir) / "payload.bin"
             normalized_path = Path(temp_dir) / "normalized"
             result = subprocess.run(
                 [
@@ -346,8 +317,39 @@ class ArchiveService:
                     "Bypass",
                     "-File",
                     str(script_path),
+                    "-InputPath",
                     str(installer_path),
+                    "-OutputPath",
                     str(normalized_path),
+                    "-PreparedPayloadPath",
+                    str(prepared_path),
+                    "-PrepareOnly",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                startupinfo=self.subprocess_startupinfo(),
+                creationflags=self.subprocess_creationflags(),
+            )
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "converter failed").strip())
+            self.decompress_lzma_payload(prepared_path, expanded_path)
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script_path),
+                    "-InputPath",
+                    str(installer_path),
+                    "-OutputPath",
+                    str(normalized_path),
+                    "-ExpandedPayloadPath",
+                    str(expanded_path),
                 ],
                 capture_output=True,
                 text=True,
@@ -514,11 +516,95 @@ class ArchiveService:
         return True
 
     @staticmethod
-    def seven_zip_exe() -> str:
-        plugin_dir = Path(__file__).resolve().parent
-        exe = plugin_dir / "7z.exe"
-        dll = plugin_dir / "7z.dll"
-        return str(exe) if exe.exists() and dll.exists() else ""
+    def seven_zip_dll() -> Path | None:
+        module_path = Path(__file__).resolve()
+        roots = [Path(sys.executable).resolve().parent, *module_path.parents]
+        for root in roots:
+            dll_path = root / "dlls" / "7zip.dll"
+            if dll_path.is_file():
+                return dll_path
+        return None
+
+    @classmethod
+    def decompress_lzma_payload(cls, source_path: Path, destination_path: Path):
+        dll_path = cls.seven_zip_dll()
+        if dll_path is None:
+            raise RuntimeError("MO2's dlls\\7zip.dll was not found")
+
+        with source_path.open("rb") as source:
+            header = source.read(13)
+            source.seek(0, os.SEEK_END)
+            source_size = source.tell()
+        if len(header) != 13 or source_size <= 13:
+            raise RuntimeError("Invalid LZMA-alone payload")
+        output_size = int.from_bytes(header[5:13], "little")
+        if output_size <= 0:
+            raise RuntimeError("Invalid LZMA output size")
+
+        dll = ctypes.WinDLL(str(dll_path))
+        uncompress = dll.LzmaUncompress
+        uncompress.restype = ctypes.c_int
+        uncompress.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with source_path.open("rb") as source, destination_path.open("w+b") as destination:
+            destination.truncate(output_size)
+            with (
+                mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_COPY) as source_map,
+                mmap.mmap(destination.fileno(), output_size, access=mmap.ACCESS_WRITE) as destination_map,
+            ):
+                properties_buffer = ctypes.c_ubyte.from_buffer(source_map, 0)
+                source_buffer = ctypes.c_ubyte.from_buffer(source_map, 13)
+                destination_buffer = ctypes.c_ubyte.from_buffer(destination_map, 0)
+                destination_length = ctypes.c_size_t(output_size)
+                source_length = ctypes.c_size_t(source_size - 13)
+                result = uncompress(
+                    ctypes.addressof(destination_buffer),
+                    ctypes.byref(destination_length),
+                    ctypes.addressof(source_buffer),
+                    ctypes.byref(source_length),
+                    ctypes.addressof(properties_buffer),
+                    5,
+                )
+                del properties_buffer, source_buffer, destination_buffer
+                if result != 0 or destination_length.value != output_size:
+                    raise RuntimeError(
+                        f"7-Zip LZMA decoding failed ({result}, {destination_length.value}/{output_size} bytes)"
+                    )
+                destination_map.flush()
+
+    @classmethod
+    def extract_archive(cls, archive_path: Path, output_path: Path) -> str:
+        dll_path = cls.seven_zip_dll()
+        if dll_path is not None:
+            try:
+                with ArchiveReader(archive_path, dll_path=dll_path) as archive:
+                    archive.extract_all(output_path)
+                return ""
+            except Exception as exc:
+                return str(exc)
+
+        if archive_path.suffix.lower() != ".zip":
+            return "MO2's dlls\\7zip.dll was not found"
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+            output_root = output_path.resolve()
+            with zipfile.ZipFile(archive_path) as archive:
+                for member in archive.infolist():
+                    destination = (output_root / member.filename).resolve()
+                    if destination != output_root and output_root not in destination.parents:
+                        raise ValueError(f"Archive entry escapes the output directory: {member.filename}")
+                archive.extractall(output_path)
+            return ""
+        except Exception as exc:
+            return str(exc)
 
     @staticmethod
     def subprocess_startupinfo():

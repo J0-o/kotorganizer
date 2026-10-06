@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,14 +11,6 @@ from pathlib import Path
 
 from archive_service import ArchiveService
 from patcher_entries import PatchEntry, collect_patch_entries
-
-
-SUBPROCESS_STARTUPINFO = None
-SUBPROCESS_CREATIONFLAGS = 0
-if os.name == "nt":
-    SUBPROCESS_STARTUPINFO = subprocess.STARTUPINFO()
-    SUBPROCESS_STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    SUBPROCESS_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW
 
 
 @dataclass
@@ -402,28 +393,7 @@ def _mark_archive_meta_installed(mod: dict, archive_path: Path, mod_name: str):
 
 
 def _extract_archive(archive_path: Path, output_path: Path) -> bool:
-    exe = _seven_zip_exe()
-    if not exe:
-        return False
-    result = subprocess.run(
-        [exe, "x", "-y", f"-o{output_path}", str(archive_path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        startupinfo=SUBPROCESS_STARTUPINFO,
-        creationflags=SUBPROCESS_CREATIONFLAGS,
-    )
-    return result.returncode == 0
-
-
-
-def _seven_zip_exe() -> str:
-    plugin_dir = Path(__file__).resolve().parent
-    exe = plugin_dir / "7z.exe"
-    dll = plugin_dir / "7z.dll"
-    return str(exe) if exe.exists() and dll.exists() else ""
+    return not ArchiveService.extract_archive(archive_path, output_path)
 
 
 

@@ -10,6 +10,9 @@ param(
     [string]$PreparedPayloadPath,
 
     [Parameter()]
+    [string]$ExpandedPayloadPath,
+
+    [Parameter()]
     [switch]$PrepareOnly
 )
 
@@ -191,15 +194,6 @@ $RenameMap = @{
     "streamvoice/904/904kreia/904904kreia999.mp3" = "streamvoice/904/904kreia/904904kreia999,1.mp3"
 }
 
-function Get-SevenZipExe {
-    $exe = Join-Path $PSScriptRoot "7z.exe"
-    $dll = Join-Path $PSScriptRoot "7z.dll"
-    if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $dll)) {
-        throw "Bundled 7-Zip is missing. Expected '$exe' and '$dll'."
-    }
-    return $exe
-}
-
 function Get-InstallerHash([string]$Path) {
     return [System.BitConverter]::ToString(
         [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes($Path))
@@ -313,23 +307,6 @@ function Write-PreparedLzmaPayload([byte[]]$ChunkBytes, [long]$OutputSize, [stri
     return $resolvedPath
 }
 
-function Expand-PreparedLzmaPayload([string]$PreparedPayloadPath, [string]$OutputDirectory) {
-    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-        New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
-    }
-
-    & (Get-SevenZipExe) x -y "-o$OutputDirectory" $PreparedPayloadPath | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "7-Zip failed to extract '$PreparedPayloadPath'."
-    }
-
-    $expandedFiles = @(Get-ChildItem -LiteralPath $OutputDirectory -File)
-    if ($expandedFiles.Count -ne 1) {
-        throw "7-Zip did not produce exactly one expanded payload file."
-    }
-    return $expandedFiles[0].FullName
-}
-
 function Resolve-RelativePayloadPath([string]$ManifestEntryPath) {
     if ($ManifestEntryPath.StartsWith("{app}\")) {
         return $ManifestEntryPath.Substring(6)
@@ -420,37 +397,40 @@ function Copy-NormalizedTree([string]$SourceDirectory, [string]$OutputDirectory)
     }
 }
 
-function New-ZipFromDirectory([string]$SourceDirectory, [string]$ArchivePath) {
-    $resolvedArchivePath = [System.IO.Path]::GetFullPath($ArchivePath)
-    $parent = Split-Path -Parent $resolvedArchivePath
-    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Path $parent | Out-Null
-    }
-    if (Test-Path -LiteralPath $resolvedArchivePath) {
-        Remove-Item -LiteralPath $resolvedArchivePath -Force
-    }
-
-    Push-Location $SourceDirectory
-    try {
-        & (Get-SevenZipExe) a -tzip -mx=0 $resolvedArchivePath ".\*" | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resolvedArchivePath)) {
-            throw "7-Zip failed to create ZIP archive '$resolvedArchivePath'."
-        }
-    }
-    finally {
-        Pop-Location
-    }
-
-    return $resolvedArchivePath
-}
-
 function Invoke-TslrcmExtract {
+    $manifest = Get-ManifestData
+    if (-not [string]::IsNullOrWhiteSpace($ExpandedPayloadPath)) {
+        $expandedPath = (Resolve-Path -LiteralPath $ExpandedPayloadPath).Path
+        $normalizedOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+        if (-not (Test-Path -LiteralPath $normalizedOutputPath)) {
+            New-Item -ItemType Directory -Path $normalizedOutputPath | Out-Null
+        }
+        else {
+            Get-ChildItem -LiteralPath $normalizedOutputPath -Force | Remove-Item -Recurse -Force
+        }
+
+        $workingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("tslrcm_extract_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            $rawDirectory = Join-Path $workingRoot "raw"
+            New-Item -ItemType Directory -Path $rawDirectory -Force | Out-Null
+            Write-RawPayloadFiles -ExpandedPayloadPath $expandedPath -Entries $manifest.Entries -OutputDirectory $rawDirectory
+            Copy-NormalizedTree -SourceDirectory $rawDirectory -OutputDirectory $normalizedOutputPath
+            $fileCount = @(Get-ChildItem -LiteralPath $normalizedOutputPath -Recurse -File).Count
+            Write-Host "Extracted $fileCount files to '$normalizedOutputPath'."
+        }
+        finally {
+            if (Test-Path -LiteralPath $workingRoot) {
+                Remove-Item -LiteralPath $workingRoot -Recurse -Force
+            }
+        }
+        return
+    }
+
     $installerPath = (Resolve-Path -LiteralPath $InputPath).Path
     if ((Get-InstallerHash -Path $installerPath) -ne $ExpectedInstallerHash) {
         throw "Unexpected installer hash for '$installerPath'."
     }
 
-    $manifest = Get-ManifestData
     $loaderOffset = [int64]$manifest.Meta["SetupLdrOffset1"]
     [byte[]]$chunkBytes = Read-ChunkBytes `
         -InstallerPath $installerPath `
@@ -471,56 +451,7 @@ function Invoke-TslrcmExtract {
         Write-Host "Prepared '$preparedPath' for $($manifest.Entries.Count) files."
         return
     }
-
-    $resolvedOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
-    $writeArchive = [System.IO.Path]::GetExtension($resolvedOutputPath).Equals(".zip", [System.StringComparison]::OrdinalIgnoreCase)
-    $normalizedOutputPath = if ($writeArchive) {
-        Join-Path ([System.IO.Path]::GetTempPath()) ("tslrcm_output_{0}" -f [guid]::NewGuid().ToString("N"))
-    }
-    else {
-        $resolvedOutputPath
-    }
-
-    if (-not (Test-Path -LiteralPath $normalizedOutputPath)) {
-        New-Item -ItemType Directory -Path $normalizedOutputPath | Out-Null
-    }
-    else {
-        Get-ChildItem -LiteralPath $normalizedOutputPath -Force | Remove-Item -Recurse -Force
-    }
-
-    $workingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("tslrcm_extract_{0}" -f [guid]::NewGuid().ToString("N"))
-    try {
-        $expandedDirectory = Join-Path $workingRoot "expanded"
-        $rawDirectory = Join-Path $workingRoot "raw"
-        New-Item -ItemType Directory -Path $expandedDirectory -Force | Out-Null
-        New-Item -ItemType Directory -Path $rawDirectory -Force | Out-Null
-
-        $expandedPayloadPath = Expand-PreparedLzmaPayload -PreparedPayloadPath $preparedPath -OutputDirectory $expandedDirectory
-        Write-RawPayloadFiles -ExpandedPayloadPath $expandedPayloadPath -Entries $manifest.Entries -OutputDirectory $rawDirectory
-        Copy-NormalizedTree -SourceDirectory $rawDirectory -OutputDirectory $normalizedOutputPath
-        $fileCount = @(Get-ChildItem -LiteralPath $normalizedOutputPath -Recurse -File).Count
-
-        if ($writeArchive) {
-            $archivePath = New-ZipFromDirectory -SourceDirectory $normalizedOutputPath -ArchivePath $resolvedOutputPath
-            Write-Host "Created ZIP archive with $fileCount files at '$archivePath'."
-        }
-        else {
-            Write-Host "Extracted $fileCount files to '$normalizedOutputPath'."
-        }
-
-        Write-Host "Prepared payload at '$preparedPath'."
-    }
-    finally {
-        if (Test-Path -LiteralPath $workingRoot) {
-            Remove-Item -LiteralPath $workingRoot -Recurse -Force
-        }
-        if ($writeArchive -and (Test-Path -LiteralPath $normalizedOutputPath)) {
-            Remove-Item -LiteralPath $normalizedOutputPath -Recurse -Force
-        }
-        if ([string]::IsNullOrWhiteSpace($PreparedPayloadPath) -and $preparedPath -and (Test-Path -LiteralPath $preparedPath)) {
-            Remove-Item -LiteralPath $preparedPath -Force
-        }
-    }
+    throw "Prepared payload decoding must be performed before calling this script with -ExpandedPayloadPath."
 }
 
 Invoke-TslrcmExtract

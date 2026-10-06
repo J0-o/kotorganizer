@@ -1,7 +1,6 @@
 import html
 import json
 import re
-import subprocess
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -318,25 +317,6 @@ class _DownloadedValidationWorker(QObject):
         if wrapped_path.suffix.lower() != ".zip":
             wrapped_path = wrapped_path.with_name(f"{wrapped_path.name}.zip")
         temp_path = wrapped_path.with_name(f"{wrapped_path.name}.tmp")
-        seven_zip = service.seven_zip_exe()
-        if seven_zip:
-            result = subprocess.run(
-                [seven_zip, "a", "-tzip", "-mx=0", str(temp_path), archive_path.name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                startupinfo=service.subprocess_startupinfo(),
-                creationflags=service.subprocess_creationflags(),
-                cwd=str(archive_path.parent),
-            )
-            if result.returncode == 0 and temp_path.exists():
-                temp_path.replace(wrapped_path)
-                if archive_path != wrapped_path and archive_path.exists():
-                    archive_path.unlink()
-                return wrapped_path, f"Wrapped loose file as uncompressed ZIP with 7-Zip: {wrapped_path.name}"
-
         original_bytes = archive_path.read_bytes()
         with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
             info = zipfile.ZipInfo(archive_path.name, _FIXED_ZIP_TIMESTAMP)

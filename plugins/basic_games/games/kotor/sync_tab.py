@@ -1638,11 +1638,6 @@ class Kotor2SyncTab(QWidget):
 
 
     @staticmethod
-    def _seven_zip_exe() -> str:
-        return ArchiveService.seven_zip_exe()
-
-
-    @staticmethod
     def _subprocess_startupinfo():
         return ArchiveService.subprocess_startupinfo()
 
