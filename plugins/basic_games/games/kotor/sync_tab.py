@@ -85,6 +85,7 @@ class _NumericTreeWidgetItem(QTreeWidgetItem):
 class Kotor2SyncTab(QWidget):
     _FETCH_TIMEOUT_SECONDS = 20
     _DOWNLOAD_QUEUE_DELAY_MS = 3000
+    _NEXUS_START_TIMEOUT_SECONDS = 15
     _KSON_REPO = "J0-o/kson_modlist"
 
 
@@ -103,6 +104,7 @@ class Kotor2SyncTab(QWidget):
         self._browser_process: subprocess.Popen | None = None
         self._browser_profile_dir: Path | None = None
         self._browser_waiting: tuple[QTreeWidgetItem, dict, Path, str, float, str, set[str]] | None = None
+        self._nexus_download_id: int | None = None
         self._fetch_thread: QThread | None = None
         self._fetch_worker: _FetchWorker | None = None
         self._validation_thread: QThread | None = None
@@ -115,6 +117,10 @@ class Kotor2SyncTab(QWidget):
         self._sync_busy = False
         self._validated_for_sync = False
         self._download_missing_available = False
+
+        download_manager = self._organizer.downloadManager()
+        download_manager.onDownloadComplete(self._finish_nexus_download)
+        download_manager.onDownloadFailed(self._fail_nexus_download)
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -466,20 +472,70 @@ class Kotor2SyncTab(QWidget):
 
         nxm_url = f"nxm://{self._nexus_game_name()}/mods/{mod_id}/files/{file_id}"
         existing_names = {path.name for path in self._downloads_path().iterdir() if path.is_file()}
-        QDesktopServices.openUrl(QUrl(nxm_url))
-        self._mark_download_pending(row, mod, f"Opened MO2/Nexus manager link: {nxm_url}")
+        try:
+            download_id = self._organizer.downloadManager().startDownloadNexusFileForGame(
+                self._nexus_game_name(),
+                int(mod_id),
+                int(file_id),
+            )
+        except Exception as exc:
+            self._append_download_detail(f"MO2 Nexus download could not start ({exc}); using browser fallback.", warning=True)
+            return False
+        if download_id < 0:
+            self._append_download_detail("MO2 Nexus download could not start; using browser fallback.", warning=True)
+            return False
+
+        self._nexus_download_id = download_id
+        self._mark_download_pending(row, mod, f"Started MO2/Nexus download: {nxm_url}")
         self._browser_waiting = (
             row,
             mod,
             self._downloads_path() / html.unescape(self._expected_archive_name(mod)),
             "MO2 nxm download",
-            time.monotonic() + 900,
+            time.monotonic() + self._NEXUS_START_TIMEOUT_SECONDS,
             url,
             existing_names,
         )
         self._stop_download_btn.setEnabled(True)
         QTimer.singleShot(2000, self._poll_browser_download)
         return True
+
+
+    def _finish_nexus_download(self, download_id: int):
+        if download_id != self._nexus_download_id:
+            return
+        self._nexus_download_id = None
+        if self._browser_waiting is not None:
+            row, mod, expected_path, _reason, _deadline, url, existing_names = self._browser_waiting
+            self._browser_waiting = (
+                row,
+                mod,
+                expected_path,
+                "MO2 Nexus download",
+                time.monotonic() + 900,
+                url,
+                existing_names,
+            )
+        QTimer.singleShot(0, self._poll_browser_download)
+
+
+    def _fail_nexus_download(self, download_id: int):
+        if download_id != self._nexus_download_id or self._browser_waiting is None:
+            return
+        row, mod, _expected_path, _reason, _deadline, url, _existing_names = self._browser_waiting
+        self._nexus_download_id = None
+        self._browser_waiting = None
+        popup_url = self._nexus_download_popup_url(mod, url)
+        self._append_download_detail("MO2 Nexus download failed; using browser fallback.", warning=True)
+        QTimer.singleShot(
+            0,
+            lambda row=row, mod=mod, popup_url=popup_url: self._start_browser_download(
+                row,
+                mod,
+                popup_url,
+                "Nexus DownloadPopUp fallback",
+            ),
+        )
 
 
     def _nexus_download_popup_url(self, mod: dict, url: str) -> str:
@@ -559,8 +615,21 @@ class Kotor2SyncTab(QWidget):
         detected_path = self._detect_browser_download(expected_path, existing_names)
         if detected_path is not None:
             self._browser_waiting = None
+            self._nexus_download_id = None
             self._mark_downloaded(row, mod, detected_path, f"{reason}: browser download detected.", continue_queue=True)
             QTimer.singleShot(2500, self._close_browser_process)
+            return
+        if "nxm" in reason.casefold() and self._has_new_download_artifact(existing_names):
+            self._browser_waiting = (
+                row,
+                mod,
+                expected_path,
+                "MO2 Nexus download",
+                time.monotonic() + 900,
+                url,
+                existing_names,
+            )
+            QTimer.singleShot(2000, self._poll_browser_download)
             return
         if self._browser_process is not None and self._browser_process.poll() is not None:
             self._browser_waiting = None
@@ -579,6 +648,7 @@ class Kotor2SyncTab(QWidget):
             return
         if time.monotonic() >= deadline:
             self._browser_waiting = None
+            self._nexus_download_id = None
             self._close_browser_process()
             fallback_url = self._nexus_download_popup_url(mod, url) if "nxm" in reason.casefold() else ""
             if fallback_url:
@@ -596,6 +666,12 @@ class Kotor2SyncTab(QWidget):
 
     def _detect_new_download(self, existing_names: set[str]) -> Path | None:
         return self._archive_service().detect_new_download(existing_names)
+
+    def _has_new_download_artifact(self, existing_names: set[str]) -> bool:
+        try:
+            return any(path.is_file() and path.name not in existing_names for path in self._downloads_path().iterdir())
+        except Exception:
+            return False
 
     @staticmethod
     def _is_incomplete_download_name(name: str) -> bool:
@@ -655,6 +731,7 @@ class Kotor2SyncTab(QWidget):
         if self._browser_waiting is not None:
             row, mod, _expected_path, _reason, _deadline, _url, existing_names = self._browser_waiting
             self._browser_waiting = None
+            self._nexus_download_id = None
             self._close_browser_process()
             self._cleanup_download_artifacts(existing_names)
             self._mark_download_stopped(row, mod, "Browser download stopped and cleaned up.")
