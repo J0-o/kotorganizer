@@ -30,6 +30,7 @@ class BuildInputMod:
     archive_path: Path | None
     version: str
     release_date: str
+    author: str
     url: str
     mod_path: Path
     repository: str = ""
@@ -55,6 +56,7 @@ class InitialBuildMod:
     url: str
     version: str = ""
     release_date: str = ""
+    author: str = ""
     repository: str = ""
     mod_id: str = ""
     file_id: str = ""
@@ -122,6 +124,7 @@ def build_initial_instruction_set(
                 "archive_xxh3": "",
                 "version": mod.version,
                 "release_date": mod.release_date,
+                "author": mod.author,
                 "url": mod.url,
                 "repository": mod.repository,
                 "mod_id": mod.mod_id,
@@ -212,6 +215,7 @@ def _build_mod_payload(mod: BuildInputMod, warnings: list[str], progress, curren
         "archive_xxh3": _file_hash(mod.archive_path) if mod.archive_path and mod.archive_path.exists() else "",
         "version": mod.version,
         "release_date": mod.release_date,
+        "author": mod.author,
         "url": mod.url,
         "repository": mod.repository,
         "mod_id": mod.mod_id,

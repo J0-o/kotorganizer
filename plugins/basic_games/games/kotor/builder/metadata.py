@@ -123,6 +123,9 @@ def write_mod_meta_for_build_match(
         general["modName"] = str(download_meta.get("modName", "")).strip()
         general["manualURL"] = str(download_meta.get("manualURL", "")).strip()
         general["url"] = str(download_meta.get("url", "")).strip()
+        author = str(download_meta.get("author", "")).strip()
+        if author:
+            general["author"] = author
         general["modID"] = str(download_meta.get("modID", "")).strip()
         general["fileID"] = str(download_meta.get("fileID", "")).strip()
     mod_path.mkdir(parents=True, exist_ok=True)

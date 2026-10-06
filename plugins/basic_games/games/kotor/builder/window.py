@@ -26,8 +26,14 @@ from PyQt6.QtWidgets import (
 from .exporter import BuildInputMod, InitialBuildMod, build_initial_instruction_set
 from .full_build_parser import BuildModEntry as _BuildModEntry
 from .full_build_parser import canonical_url as _canonical_url
-from .full_build_parser import fetch_build_entries
-from .kotor_repo import KOTOR_REPO_DATA_URL, KotorRepoMetadata, fetch_kotor_repo_metadata
+from .kotor_repo import (
+    KOTOR_REPO_DATA_URL,
+    KotorRepoMetadata,
+    fetch_kotor_repo_data,
+    fetch_kotor_repo_metadata,
+    parse_kotor_repo_build_entries,
+    parse_kotor_repo_metadata,
+)
 from .metadata import (
     DownloadMetaEntry,
     download_meta_info,
@@ -53,7 +59,7 @@ from .nexus import (
 )
 from .validation import versions_equal
 from .workers import _BuildWorker, _NumericTreeWidgetItem
-from ..ui_theme import configure_tree_widget, set_header_resize_mode
+from ..ui_theme import configure_tree_widget, refresh_mo2, set_header_resize_mode
 
 
 
@@ -97,6 +103,12 @@ class KotorBuilderWindow(QWidget):
         self._browser_waiting: tuple[_BuildModEntry, Path, str, float, str, set[str], dict[str, str]] | None = None
         self._download_total = 0
         self._download_existing_names: set[str] = set()
+        self._author_by_url: dict[str, str] = {}
+        self._author_queue: list[tuple[str, str]] = []
+        self._author_process: QProcess | None = None
+        self._author_total = 0
+        self._author_updated = 0
+        self._author_failed = 0
         self._init_nexus_bridge()
         self._load_cache()
 
@@ -116,6 +128,8 @@ class KotorBuilderWindow(QWidget):
         self._validate_btn.clicked.connect(self._validate_matches)
         self._force_release_btn = QPushButton("Force ReleaseDate Update")
         self._force_release_btn.clicked.connect(self._force_release_date_update)
+        self._grab_authors_btn = QPushButton("Grab Authors")
+        self._grab_authors_btn.clicked.connect(self._grab_authors)
         self._apply_all_meta_btn = QPushButton("Apply All Meta")
         self._apply_all_meta_btn.clicked.connect(self._apply_all_meta)
         self._stop_validate_btn = QPushButton("Stop")
@@ -128,6 +142,7 @@ class KotorBuilderWindow(QWidget):
         header.addWidget(self._download_all_btn)
         header.addWidget(self._validate_btn)
         header.addWidget(self._force_release_btn)
+        header.addWidget(self._grab_authors_btn)
         header.addWidget(self._apply_all_meta_btn)
         header.addWidget(self._stop_validate_btn)
         header.addWidget(self._summary_label)
@@ -223,7 +238,11 @@ class KotorBuilderWindow(QWidget):
     def _fetch_full_build(self):
         try:
             page_url = self._full_build_url()
-            self._build_entries = fetch_build_entries(page_url, self._FETCH_TIMEOUT_SECONDS)
+            payload = fetch_kotor_repo_data(self._game.gameShortName(), self._FETCH_TIMEOUT_SECONDS)
+            self._build_entries = parse_kotor_repo_build_entries(payload)
+            for url, metadata in parse_kotor_repo_metadata(payload).items():
+                if metadata.author:
+                    self._author_by_url[url] = metadata.author
             self._save_cache()
             self.refresh()
             self._details.setPlainText(
@@ -589,6 +608,7 @@ class KotorBuilderWindow(QWidget):
         self._download_all_btn.setEnabled(not running)
         self._refresh_btn.setEnabled(not running)
         self._fetch_btn.setEnabled(not running)
+        self._grab_authors_btn.setEnabled(not running)
         self._build_btn.setEnabled(not running)
 
 
@@ -681,9 +701,21 @@ class KotorBuilderWindow(QWidget):
             or str(payload.get("Name", "")).strip()
             or str(payload.get("ModName", "")).strip()
         )
-        version = str(payload.get("CurrentVersion", "")).strip()
-        current_version_release_date = str(payload.get("CurrentVersionReleaseDate", "")).strip()
-        submitted_date = str(payload.get("SubmittedDate", "")).strip()
+        author = str(payload.get("Author") or payload.get("author") or "").strip()
+        version = str(
+            payload.get("SelectedVersion")
+            or payload.get("LatestVersion")
+            or payload.get("CurrentVersion")
+            or ""
+        ).strip()
+        newest_version = str(payload.get("LatestVersion") or payload.get("CurrentVersion") or version).strip()
+        current_version_release_date = str(
+            payload.get("SelectedVersionReleaseDate")
+            or payload.get("LatestVersionReleaseDate")
+            or payload.get("CurrentVersionReleaseDate")
+            or ""
+        ).strip()
+        submitted_date = str(payload.get("OriginalUploadDate") or payload.get("SubmittedDate") or "").strip()
         published_date = str(payload.get("PublishedDate", "")).strip()
         effective_date = str(payload.get("EffectiveDate") or payload.get("UpdatedDate") or "").strip()
         release_date = current_version_release_date or published_date or submitted_date or effective_date
@@ -693,11 +725,12 @@ class KotorBuilderWindow(QWidget):
             "gameName": self._game.gameShortName().lower(),
             "modName": entry.name,
             "version": version,
-            "newestVersion": version,
+            "newestVersion": newest_version,
             "manualURL": source_url,
             "url": source_url,
             "repository": "DeadlyStream",
             self._ARCHIVE_RELEASE_DATE_FIELD: release_date,
+            "author": author,
             "Title": title,
             "SourceUrl": source_url,
             "DownloadPageUrl": str(payload.get("DownloadPageUrl", "")).strip(),
@@ -713,7 +746,8 @@ class KotorBuilderWindow(QWidget):
             return {}
         if isinstance(payload.get("Metadata"), dict):
             metadata = dict(payload.get("Metadata") or {})
-            download = payload.get("Download")
+            downloads = payload.get("Downloads")
+            download = downloads[0] if isinstance(downloads, list) and downloads else payload.get("Download")
             if isinstance(download, dict):
                 for key in ("AvailableDownloads", "FileName", "FilePath", "FinalUrl"):
                     if key not in metadata and key in download:
@@ -737,6 +771,7 @@ class KotorBuilderWindow(QWidget):
             "manualURL": url,
             "url": url,
             "repository": repository,
+            "author": self._author_by_url.get(_canonical_url(url), ""),
             "modID": nexus_mod_id_from_url(url) if repository == "Nexus" else "",
             "fileID": nexus_file_id_from_url(url) if repository == "Nexus" else "",
         }
@@ -941,6 +976,10 @@ class KotorBuilderWindow(QWidget):
                     url=url,
                     version=str(meta.get("version", "")).strip() or str(meta.get("newestVersion", "")).strip(),
                     release_date=str(meta.get(self._ARCHIVE_RELEASE_DATE_FIELD, "")).strip(),
+                    author=(
+                        self._author_by_url.get(_canonical_url(url), "")
+                        or str(meta.get("author", "")).strip()
+                    ),
                     repository=repository,
                     mod_id=str(meta.get("modID", "")).strip() or nexus_mod_id_from_url(url),
                     file_id=str(meta.get("fileID", "")).strip(),
@@ -996,6 +1035,132 @@ class KotorBuilderWindow(QWidget):
 
     def _force_release_date_update(self):
         self._start_validation(force_release_update=True)
+
+
+    def _grab_authors(self):
+        if (
+            self._author_process is not None
+            or self._author_queue
+            or self._download_process is not None
+            or self._download_queue
+            or self._validation_queue
+            or self._build_thread is not None
+        ):
+            return
+        scraper = self._deadly_scraper_exe()
+        if not scraper.exists():
+            QMessageBox.warning(self, "Grab Authors", f"DeadlyScraper.exe not found:\n{scraper}")
+            return
+
+        queue: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for entry in self._build_entries:
+            for raw_url in entry.urls:
+                url = str(raw_url).strip()
+                canonical = _canonical_url(url)
+                if "deadlystream.com" not in urlparse(url).netloc.casefold() or not canonical or canonical in seen:
+                    continue
+                seen.add(canonical)
+                queue.append((entry.name, url))
+        for installed in self._installed_mod_entries():
+            for url in installed.urls:
+                canonical = _canonical_url(url)
+                if "deadlystream.com" not in urlparse(url).netloc.casefold() or not canonical or canonical in seen:
+                    continue
+                seen.add(canonical)
+                queue.append((installed.name, url))
+
+        if not queue:
+            QMessageBox.information(self, "Grab Authors", "No DeadlyStream URLs are available.")
+            return
+
+        self._author_queue = queue
+        self._author_total = len(queue)
+        self._author_updated = 0
+        self._author_failed = 0
+        self._set_author_running(True)
+        self._details.setPlainText(f"Grabbing authors for {self._author_total} DeadlyStream mod(s).")
+        self._process_next_author()
+
+
+    def _set_author_running(self, running: bool):
+        self._refresh_btn.setEnabled(not running)
+        self._fetch_btn.setEnabled(not running)
+        self._download_all_btn.setEnabled(not running)
+        self._validate_btn.setEnabled(not running)
+        self._force_release_btn.setEnabled(not running)
+        self._grab_authors_btn.setEnabled(not running)
+        self._apply_all_meta_btn.setEnabled(not running)
+        self._build_btn.setEnabled(not running)
+        self._stop_validate_btn.setEnabled(False)
+
+
+    def _process_next_author(self):
+        if self._author_process is not None:
+            return
+        if not self._author_queue:
+            self._save_cache()
+            self._set_author_running(False)
+            self.refresh()
+            refresh_mo2(self._organizer, self)
+            self._summary_label.setText(
+                f"Authors updated: {self._author_updated}; failed: {self._author_failed}"
+            )
+            self._details.appendPlainText(
+                f"\nAuthor lookup complete. Updated {self._author_updated}; failed {self._author_failed}."
+            )
+            self._author_total = 0
+            return
+
+        name, url = self._author_queue.pop(0)
+        current = self._author_total - len(self._author_queue)
+        self._summary_label.setText(f"grabbing author {current}/{self._author_total}: {name}")
+        process = QProcess(self)
+        self._author_process = process
+        process.finished.connect(
+            lambda code, _status, name=name, url=url, process=process:
+            self._finish_author_lookup(name, url, process, code)
+        )
+        process.start(str(self._deadly_scraper_exe()), [url])
+
+
+    def _finish_author_lookup(self, name: str, url: str, process: QProcess, exit_code: int):
+        stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+        stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._author_process = None
+        process.deleteLater()
+        payload = self._deadlystream_payload_from_stdout(stdout)
+        author = str(payload.get("Author") or payload.get("author") or "").strip()
+        if exit_code == 0 and author:
+            self._store_author(url, author)
+            self._author_updated += 1
+            self._details.appendPlainText(f"\n{name}: {author}")
+        else:
+            self._author_failed += 1
+            detail = stderr or "DeadlyScraper returned no author."
+            self._details.appendPlainText(f"\n{name}: author lookup failed. {detail}")
+        QTimer.singleShot(0, self._process_next_author)
+
+
+    def _store_author(self, url: str, author: str):
+        canonical = _canonical_url(url)
+        if not canonical or not author:
+            return
+        self._author_by_url[canonical] = author
+        for _archive_name, meta_path, meta in self._download_meta_entries():
+            meta_urls = installed_mod_urls(meta, self._game.gameShortName())
+            if canonical not in {_canonical_url(candidate) for candidate in meta_urls}:
+                continue
+            if write_download_meta_field(meta_path, "author", author):
+                meta["author"] = author
+        mods_root = Path(self._organizer.modsPath())
+        for installed in self._installed_mod_entries():
+            installed_urls = {_canonical_url(candidate) for candidate in installed.urls}
+            for entry in self._matching_build_entries(installed):
+                installed_urls.update(_canonical_url(candidate) for candidate in entry.urls)
+            if canonical not in installed_urls:
+                continue
+            write_download_meta_field(mods_root / installed.name / "meta.ini", "author", author)
 
 
     def _validate_single_mod(self, mod_name: str):
@@ -1061,6 +1226,7 @@ class KotorBuilderWindow(QWidget):
         self._fetch_btn.setEnabled(not running)
         self._validate_btn.setEnabled(not running)
         self._force_release_btn.setEnabled(not running)
+        self._grab_authors_btn.setEnabled(not running)
         self._apply_all_meta_btn.setEnabled(not running)
         self._build_btn.setEnabled(not running and not build_running)
         self._stop_validate_btn.setEnabled(running)
@@ -1071,6 +1237,7 @@ class KotorBuilderWindow(QWidget):
         self._fetch_btn.setEnabled(not running)
         self._validate_btn.setEnabled(not running)
         self._force_release_btn.setEnabled(not running)
+        self._grab_authors_btn.setEnabled(not running)
         self._apply_all_meta_btn.setEnabled(not running)
         self._build_btn.setEnabled(not running)
         self._stop_validate_btn.setEnabled(False)
@@ -1101,6 +1268,10 @@ class KotorBuilderWindow(QWidget):
                     archive_path=archive_file if archive_file and archive_file.exists() else None,
                     version=self._current_archive_version(installed),
                     release_date=installed.download_meta.get(self._ARCHIVE_RELEASE_DATE_FIELD, "").strip(),
+                    author=(
+                        self._author_by_url.get(_canonical_url(build_url), "")
+                        or installed.download_meta.get("author", "").strip()
+                    ),
                     url=build_url,
                     mod_path=Path(self._organizer.modsPath()) / installed.name,
                     repository=installed.download_meta.get("repository", "").strip(),
@@ -1731,14 +1902,15 @@ class KotorBuilderWindow(QWidget):
             return
         cache_version = int(payload.get("cache_version", 0) or 0)
 
-        self._build_entries = [
-            _BuildModEntry(
-                name=str(item.get("name", "")).strip(),
-                urls=[str(url).strip() for url in item.get("urls", []) if str(url).strip()],
-            )
-            for item in payload.get("build_entries", [])
-            if str(item.get("name", "")).strip()
-        ]
+        if str(payload.get("build_source", "")).strip() == self._full_build_url():
+            self._build_entries = [
+                _BuildModEntry(
+                    name=str(item.get("name", "")).strip(),
+                    urls=[str(url).strip() for url in item.get("urls", []) if str(url).strip()],
+                )
+                for item in payload.get("build_entries", [])
+                if str(item.get("name", "")).strip()
+            ]
         if cache_version != self._CACHE_VERSION:
             self._validation_by_mod = {}
             return
@@ -1760,6 +1932,11 @@ class KotorBuilderWindow(QWidget):
             for mod_name, archive in payload.get("manual_archive_by_mod", {}).items()
             if str(mod_name).strip() and str(archive).strip()
         }
+        self._author_by_url = {
+            str(url): str(author).strip()
+            for url, author in payload.get("author_by_url", {}).items()
+            if str(url).strip() and str(author).strip()
+        }
 
 
     def _save_cache(self):
@@ -1778,6 +1955,7 @@ class KotorBuilderWindow(QWidget):
             },
             "manual_build_match_by_mod": self._manual_build_match_by_mod,
             "manual_archive_by_mod": self._manual_archive_by_mod,
+            "author_by_url": self._author_by_url,
         }
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1787,11 +1965,8 @@ class KotorBuilderWindow(QWidget):
 
 
     def _full_build_url(self) -> str:
-        return (
-            "https://raw.githubusercontent.com/KOTOR-Community-Portal/mod-builds/refs/heads/dev/content/k2/full.md"
-            if self._game.gameShortName().lower() == "kotor2"
-            else "https://raw.githubusercontent.com/KOTOR-Community-Portal/mod-builds/refs/heads/dev/content/k1/full.md"
-        )
+        game = "k2" if self._game.gameShortName().lower() == "kotor2" else "k1"
+        return KOTOR_REPO_DATA_URL.format(game=game)
 
 
     def _matching_build_entries(self, installed: _InstalledModEntry) -> list[_BuildModEntry]:
