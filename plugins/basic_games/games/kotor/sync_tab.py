@@ -377,14 +377,12 @@ class Kotor2SyncTab(QWidget):
         if not scraper.exists():
             self._append_download_detail("DeadlyScraper.exe is missing; using browser fallback.", warning=True)
             return False
-        download_url = url
-        selected_url, selection_note = self._resolve_deadlystream_download_url(mod, url)
-        if not selected_url:
+        selected_version, selection_note = self._resolve_deadlystream_download_version(mod, url)
+        if selected_version is None:
             self._append_download_detail(selection_note or "DeadlyScraper could not resolve a matching DeadlyStream version.", warning=True)
             return False
         if selection_note:
             self._append_download_detail(selection_note)
-        download_url = selected_url
         process = QProcess(self)
         self._download_process = process
         self._download_process_context = (
@@ -397,9 +395,12 @@ class Kotor2SyncTab(QWidget):
             lambda _code, _status, row=row, mod=mod, process=process:
             self._finish_deadlystream_download(row, mod, process)
         )
-        args = [download_url, "--download", str(self._downloads_path())]
+        args = [url]
+        if selected_version:
+            args.extend(["--version", selected_version])
+        args.extend(["--download", str(self._downloads_path())])
         if archive_name and not self._is_tslrcm_expected_archive_name(archive_name):
-            args.extend(["--select", archive_name])
+            args.extend(["--file", archive_name])
         process.start(str(scraper), args)
         return True
 
@@ -407,6 +408,9 @@ class Kotor2SyncTab(QWidget):
     def _finish_deadlystream_download(self, row: QTreeWidgetItem, mod: dict, process: QProcess):
         stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
         stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        author = self._deadlystream_author_from_stdout(stdout)
+        if author:
+            mod["author"] = author
         self._download_process = None
         context = self._download_process_context
         self._download_process_context = None
@@ -536,6 +540,20 @@ class Kotor2SyncTab(QWidget):
                 "Nexus DownloadPopUp fallback",
             ),
         )
+
+
+    @staticmethod
+    def _deadlystream_author_from_stdout(stdout: str) -> str:
+        try:
+            payload = json.loads(stdout) if stdout else {}
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        metadata = payload.get("Metadata")
+        if isinstance(metadata, dict):
+            payload = metadata
+        return str(payload.get("Author") or payload.get("author") or "").strip()
 
 
     def _nexus_download_popup_url(self, mod: dict, url: str) -> str:
@@ -1658,12 +1676,15 @@ class Kotor2SyncTab(QWidget):
             return ""
         return parser.get("General", key, fallback="").strip()
 
-    def _query_deadlystream_versions(self, url: str) -> tuple[dict | None, str]:
+    def _query_deadlystream_metadata(self, url: str, version_label: str = "") -> tuple[dict | None, str]:
         scraper = Path(__file__).resolve().parent / "DeadlyScraper.exe"
         if not scraper.exists():
             return None, "DeadlyScraper.exe is missing."
+        args = [str(scraper), url]
+        if version_label:
+            args.extend(["--version", version_label])
         result = subprocess.run(
-            [str(scraper), url, "--check-all-versions"],
+            args,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1683,31 +1704,50 @@ class Kotor2SyncTab(QWidget):
             return None, "DeadlyScraper returned an unexpected payload."
         return payload, ""
 
-    def _resolve_deadlystream_download_url(self, mod: dict, url: str) -> tuple[str, str]:
+    def _resolve_deadlystream_download_version(self, mod: dict, url: str) -> tuple[str | None, str]:
         expected_release_date = self._normalize_release_date(str(mod.get("release_date") or ""))
         if not expected_release_date:
-            return url, ""
-        payload, error = self._query_deadlystream_versions(url)
+            return "", ""
+        payload, error = self._query_deadlystream_metadata(url)
         if payload is None:
-            return "", f"DeadlyScraper version query failed for {self._kson_mod_name(mod)}: {error}"
+            return None, f"DeadlyScraper version query failed for {self._kson_mod_name(mod)}: {error}"
         current_release_date = self._normalize_release_date(
-            str(payload.get("EffectiveDate") or payload.get("PublishedDate") or payload.get("CurrentVersionReleaseDate") or "")
+            str(
+                payload.get("LatestVersionReleaseDate")
+                or payload.get("EffectiveDate")
+                or payload.get("PublishedDate")
+                or payload.get("CurrentVersionReleaseDate")
+                or ""
+            )
         )
         if current_release_date == expected_release_date:
-            return url, f"DeadlyScraper confirmed current DeadlyStream version date {expected_release_date}."
-        for version in payload.get("VersionHistory", []):
-            if not isinstance(version, dict):
+            return "", f"DeadlyScraper confirmed current DeadlyStream version date {expected_release_date}."
+
+        version_history = payload.get("VersionHistory", "")
+        if isinstance(version_history, str):
+            version_labels = [label.strip() for label in version_history.split(",") if label.strip()]
+        elif isinstance(version_history, list):
+            version_labels = [
+                str(version.get("VersionLabel") or "").strip()
+                for version in version_history
+                if isinstance(version, dict) and str(version.get("VersionLabel") or "").strip()
+            ]
+        else:
+            version_labels = []
+
+        for version_label in version_labels:
+            version_payload, _error = self._query_deadlystream_metadata(url, version_label)
+            if version_payload is None:
                 continue
-            release_date = self._normalize_release_date(str(version.get("ReleaseDate") or ""))
-            if release_date != expected_release_date:
-                continue
-            download_url = str(version.get("ChangelogUrl") or version.get("DownloadPageUrl") or "").strip()
-            if download_url:
-                version_label = str(version.get("VersionLabel") or "").strip()
-                if version_label:
-                    return download_url, f"DeadlyScraper selected DeadlyStream version {version_label} for release date {expected_release_date}."
-                return download_url, f"DeadlyScraper selected the DeadlyStream version published on {expected_release_date}."
-        return "", f"No DeadlyStream version matches KSON release date {expected_release_date} for {self._kson_mod_name(mod)}."
+            release_date = self._normalize_release_date(
+                str(version_payload.get("SelectedVersionReleaseDate") or "")
+            )
+            if release_date == expected_release_date:
+                return (
+                    version_label,
+                    f"DeadlyScraper selected DeadlyStream version {version_label} for release date {expected_release_date}.",
+                )
+        return None, f"No DeadlyStream version matches KSON release date {expected_release_date} for {self._kson_mod_name(mod)}."
 
     @staticmethod
     def _is_tslrcm_expected_archive_name(name: str) -> bool:
@@ -1908,6 +1948,7 @@ class Kotor2SyncTab(QWidget):
             "url": url,
             "repository": repository,
             "ArchiveReleaseDate": str(mod.get("release_date") or "").strip(),
+            "author": str(mod.get("author") or "").strip(),
             "KsonArchiveXXH3": str(mod.get("archive_xxh3") or "").strip(),
         }
 
@@ -1944,7 +1985,7 @@ class Kotor2SyncTab(QWidget):
         if "local_archive_name" in mod:
             mod.pop("local_archive_name", None)
             changed = True
-        if changed:
+        if changed or str(mod.get("author") or "").strip():
             self._write_cached_kson_mod_update(mod)
 
     def _write_cached_kson_mod_update(self, mod: dict):
@@ -1967,6 +2008,8 @@ class Kotor2SyncTab(QWidget):
                 continue
             item["archive_name"] = self._expected_archive_name(mod)
             item["archive_xxh3"] = str(mod.get("archive_xxh3") or "").strip()
+            if str(mod.get("author") or "").strip():
+                item["author"] = str(mod.get("author") or "").strip()
             if self._kson_mod_skipped(mod):
                 item["_sync_skip"] = True
             else:

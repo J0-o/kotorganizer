@@ -144,7 +144,7 @@ def _move_existing_mods(mods_path: Path, warnings: list[str]) -> tuple[list[str]
     old_mods_path = old_mods_root / datetime.now().strftime("%Y%m%d_%H%M%S")
     moved_any = False
     for mod_path in sorted(path for path in mods_path.iterdir() if path.is_dir()):
-        if mod_path.name.casefold().startswith("[nodelete]"):
+        if mod_path.name.casefold().startswith(("[nodelete]", "[no delete]")):
             preserved.append(mod_path.name)
             continue
         try:
@@ -316,8 +316,10 @@ def _write_mod_meta(mod: dict, mod_path: Path, archive_path: Path):
     archive_meta = _read_archive_meta(archive_path)
     archive_meta_version = _archive_meta_value(archive_meta, "version")
     archive_meta_release_date = _archive_meta_value(archive_meta, "ArchiveReleaseDate")
+    archive_meta_author = _archive_meta_value(archive_meta, "author")
     effective_version = mod_version or archive_meta_version or archive_meta_release_date
     effective_release_date = archive_release_date or archive_meta_release_date
+    effective_author = str(mod.get("author") or "").strip() or archive_meta_author
 
     fields = {
         "installationFile": archive_name,
@@ -330,6 +332,7 @@ def _write_mod_meta(mod: dict, mod_path: Path, archive_path: Path):
         "version": effective_version,
         "newestVersion": effective_version,
         "ArchiveReleaseDate": effective_release_date,
+        "author": effective_author,
         "modID": str(mod.get("mod_id") or mod.get("modID") or "").strip(),
         "fileID": str(mod.get("file_id") or mod.get("fileID") or "").strip(),
     }
@@ -381,6 +384,7 @@ def _mark_archive_meta_installed(mod: dict, archive_path: Path, mod_name: str):
         ("version", "version"),
         ("version", "newestVersion"),
         ("release_date", "ArchiveReleaseDate"),
+        ("author", "author"),
         ("repository", "repository"),
         ("mod_id", "modID"),
         ("file_id", "fileID"),
