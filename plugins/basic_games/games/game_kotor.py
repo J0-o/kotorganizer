@@ -82,7 +82,7 @@ class StarWarsKotorGame(KotorGameMixin, BasicGame, mobase.IPluginFileMapper):
         super().init(organizer)
         self._organizer = organizer
 
-        self._register_feature(BasicLocalSavegames(self.savesDirectory()))
+        self._register_feature(BasicLocalSavegames(self))
         self._register_feature(BasicGameSaveGameInfo(KotorSaveGame, parse_kotor_save_metadata))
         self._register_feature(KotorModDataChecker())
         organizer.onUserInterfaceInitialized(self._init_custom_tabs)
