@@ -1,7 +1,3 @@
-KOTORganizer distribution note: only the Python wrapper source is included.
-The 7z.dll described in the upstream notice below is not redistributed by
-KOTORganizer; archive operations use the copy supplied by Mod Organizer 2.
-
 MIT License
 
 Copyright (c) Modding Forge
