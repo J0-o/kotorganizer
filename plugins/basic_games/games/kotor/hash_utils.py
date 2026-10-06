@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import zlib
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,20 +16,21 @@ if os.name == "nt":
 
 def file_hash(path: Path) -> str:
     exe = xxhsum_exe()
-    if exe:
-        result = subprocess.run(
-            [exe, "-H3", str(path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            startupinfo=SUBPROCESS_STARTUPINFO,
-            creationflags=SUBPROCESS_CREATIONFLAGS,
-        )
-        if result.returncode == 0:
-            return parse_xxhsum_output(result.stdout)
-    return xxh3_bytes(path.read_bytes())
+    if not exe:
+        raise RuntimeError("xxhsum is required to calculate XXH3 hashes")
+    result = subprocess.run(
+        [exe, "-H3", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        startupinfo=SUBPROCESS_STARTUPINFO,
+        creationflags=SUBPROCESS_CREATIONFLAGS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"xxhsum failed with exit code {result.returncode}: {result.stderr.strip()}")
+    return parse_xxhsum_output(result.stdout)
 
 
 
@@ -41,18 +41,20 @@ def file_hashes(paths: list[Path]) -> dict[Path, str]:
 
 def xxh3_bytes(data: bytes) -> str:
     exe = xxhsum_exe()
-    if exe:
-        result = subprocess.run(
-            [exe, "-H3", "-"],
-            input=data,
-            capture_output=True,
-            check=False,
-            startupinfo=SUBPROCESS_STARTUPINFO,
-            creationflags=SUBPROCESS_CREATIONFLAGS,
-        )
-        if result.returncode == 0:
-            return parse_xxhsum_output(result.stdout.decode("utf-8", errors="replace"))
-    return f"crc32:{zlib.crc32(data) & 0xFFFFFFFF:08x}"
+    if not exe:
+        raise RuntimeError("xxhsum is required to calculate XXH3 hashes")
+    result = subprocess.run(
+        [exe, "-H3", "-"],
+        input=data,
+        capture_output=True,
+        check=False,
+        startupinfo=SUBPROCESS_STARTUPINFO,
+        creationflags=SUBPROCESS_CREATIONFLAGS,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"xxhsum failed with exit code {result.returncode}: {stderr}")
+    return parse_xxhsum_output(result.stdout.decode("utf-8", errors="replace"))
 
 
 
