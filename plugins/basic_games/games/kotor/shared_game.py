@@ -30,6 +30,7 @@ class KotorGameMixin:
             self.overrideDirectory(),
             self.streamMusicDirectory(),
             self.streamSoundsDirectory(),
+            self.streamWavesDirectory(),
             self.streamVoiceDirectory(),
             self.texturePacksDirectory(),
             self.savesDirectory(),
@@ -64,6 +65,10 @@ class KotorGameMixin:
         return QDir(self.gameDirectory().absolutePath() + "/StreamSounds")
 
 
+    def streamWavesDirectory(self):
+        return QDir(self.gameDirectory().absolutePath() + "/StreamWaves")
+
+
     def streamVoiceDirectory(self):
         return QDir(self.gameDirectory().absolutePath() + "/StreamVoice")
 
@@ -85,6 +90,7 @@ class KotorGameMixin:
             "Override": [self.overrideDirectory().absolutePath()],
             "StreamMusic": [self.streamMusicDirectory().absolutePath()],
             "StreamSounds": [self.streamSoundsDirectory().absolutePath()],
+            "StreamWaves": [self.streamWavesDirectory().absolutePath()],
             "StreamVoice": [self.streamVoiceDirectory().absolutePath()],
             "TexturePacks": [self.texturePacksDirectory().absolutePath()],
         }
