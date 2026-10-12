@@ -511,6 +511,9 @@ class KotorBuilderWindow(QWidget):
             return
 
         menu = QMenu(self)
+        web_url = self._web_url_for_item(item)
+        open_web_action = menu.addAction("Open in Web Browser")
+        open_web_action.setEnabled(web_url.isValid() and web_url.scheme().lower() in {"http", "https"})
         download_action = menu.addAction("Download")
         validate_action = menu.addAction("Validate Mod")
         validate_action.setEnabled(self._nexus_validation_current is None)
@@ -519,7 +522,9 @@ class KotorBuilderWindow(QWidget):
         override_action = menu.addAction("Clear Override" if is_override else "Override")
         download_action.setEnabled(self._download_url_for_item(item) != "")
         chosen_action = menu.exec(self._tree.viewport().mapToGlobal(pos))
-        if chosen_action is download_action:
+        if chosen_action is open_web_action:
+            QDesktopServices.openUrl(web_url)
+        elif chosen_action is download_action:
             self._download_item(item)
         elif chosen_action is validate_action:
             self._validate_single_mod(mod_name)
@@ -555,6 +560,16 @@ class KotorBuilderWindow(QWidget):
         entry = self._download_entry_for_item(item)
         if entry is not None and entry.urls:
             return QUrl(str(entry.urls[0]))
+        return QUrl()
+
+
+    def _web_url_for_item(self, item: QTreeWidgetItem) -> QUrl:
+        entry = self._download_entry_for_item(item)
+        if entry is not None and entry.urls:
+            return QUrl(str(entry.urls[0]))
+        installed = item.data(0, Qt.ItemDataRole.UserRole + 2)
+        if isinstance(installed, _InstalledModEntry) and installed.urls:
+            return QUrl(str(installed.urls[0]))
         return QUrl()
 
 
