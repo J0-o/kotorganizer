@@ -11,18 +11,22 @@ from PyQt6.QtWidgets import (
 
 
 class KotorInfoTab(QWidget):
+    _COMMUNITY_PORTAL = (
+        "KOTOR Community Portal",
+        "https://kotor.neocities.org/",
+    )
     _TOOLS = (
         (
             "HoloPatcher",
-            "https://github.com/NickHugi/PyKotor",
+            "https://github.com/vrifftech/HoloPatcher",
         ),
         (
             "DeadlyScraper",
-            "https://github.com/search?q=DeadlyScraper&type=repositories",
+            "https://github.com/J0-o/DeadlyScraper",
         ),
         (
-            "7-Zip",
-            "https://github.com/ip7z/7zip",
+            "PyZip",
+            "https://github.com/Modding-Forge",
         ),
         (
             "xxHash",
@@ -45,6 +49,14 @@ class KotorInfoTab(QWidget):
         version = QLabel(f"{self._game_short_name()} Plugin {self._game_version()}")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(18)
+
+        name, url = self._COMMUNITY_PORTAL
+        button = QPushButton(name)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setMinimumWidth(220)
+        button.clicked.connect(lambda _checked=False, link=url: QDesktopServices.openUrl(QUrl(link)))
+        layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addSpacing(18)
 
         for name, url in self._TOOLS:
