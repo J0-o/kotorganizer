@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -208,6 +208,7 @@ class _PatcherRunnerDialog(QDialog):
         self._log_box = QPlainTextEdit(self)
         self._log_box.setReadOnly(True)
         self._log_box.setPlaceholderText("Patcher prepare/run logs will appear here.")
+        self._log_box.document().setMaximumBlockCount(20000)
         layout.addWidget(self._log_box, 1)
 
         self._busy_timer = QTimer(self)
@@ -218,6 +219,14 @@ class _PatcherRunnerDialog(QDialog):
     def set_log_text(self, text: str):
         self._log_box.setPlainText(text)
         self._log_box.verticalScrollBar().setValue(self._log_box.verticalScrollBar().maximum())
+
+
+    def append_log_text(self, text: str):
+        if not text:
+            return
+        self._log_box.moveCursor(QTextCursor.MoveOperation.End)
+        self._log_box.insertPlainText(text)
+        self._log_box.ensureCursorVisible()
 
 
     def _advance_busy_status(self):

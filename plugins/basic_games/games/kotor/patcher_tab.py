@@ -2,10 +2,12 @@ import configparser
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -884,13 +886,74 @@ class Kotor2PatcherTab(QWidget):
 
 
     def _append_status_text(self, text: str):
-        if self._runner_log_text:
-            self._runner_log_text = f"{self._runner_log_text.rstrip()}\n\n{text}"
-        else:
-            self._runner_log_text = text
+        addition = f"\n\n{text}" if self._runner_log_text else text
+        self._runner_log_text += addition
         if self._runner_dialog is not None:
-            self._runner_dialog.set_log_text(self._runner_log_text)
+            self._runner_dialog.append_log_text(addition)
         QApplication.processEvents()
+
+
+    def _append_live_status_text(self, text: str):
+        if not text:
+            return
+        self._runner_log_text += text
+        if self._runner_dialog is not None:
+            self._runner_dialog.append_log_text(text)
+
+
+    def _run_holopatcher_process(self, cmd: list[str], output_callback=None) -> tuple[int, str]:
+        output_queue: queue.Queue[str] = queue.Queue()
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+        self._current_patcher_process = process
+
+        def _read_output():
+            if process.stdout is None:
+                return
+            try:
+                for line in process.stdout:
+                    output_queue.put(line)
+            finally:
+                process.stdout.close()
+
+        reader = threading.Thread(target=_read_output, daemon=True)
+        reader.start()
+        output: list[str] = []
+
+        try:
+            while process.poll() is None or reader.is_alive() or not output_queue.empty():
+                batch: list[str] = []
+                for _ in range(500):
+                    try:
+                        text = output_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    output.append(text)
+                    batch.append(text)
+                if batch and output_callback is not None:
+                    output_callback("".join(batch))
+
+                QApplication.processEvents()
+                if self._stop_patcher_requested and process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+
+            reader.join()
+            return process.wait(), "".join(output)
+        finally:
+            self._current_patcher_process = None
 
 
     def _set_runner_busy(self, running: bool, status: str = "Running"):
@@ -1014,25 +1077,19 @@ class Kotor2PatcherTab(QWidget):
                 str(test_dir),
                 "--tslpatchdata",
                 str(temp_patch),
+                "--yes",
+                "--non-interactive",
             ]
-            process = subprocess.Popen(cmd)
-            self._current_patcher_process = process
-            while process.poll() is None:
-                QApplication.processEvents()
-                if self._stop_patcher_requested:
-                    try:
-                        process.terminate()
-                    except Exception:
-                        pass
-                    break
-                time.sleep(0.05)
+            returncode, live_output = self._run_holopatcher_process(cmd)
+            if live_output.strip():
+                lines.extend(["", "HoloPatcher live log:", live_output.strip()])
 
             install_log = temp_mod / "installlog.txt"
             if install_log.exists():
                 shutil.copy2(install_log, log_dir / f"{self._safe_name(label)}_test.txt")
                 raw_install_log = install_log.read_text(encoding="utf-8", errors="ignore").strip()
                 install_log_text, patch_error_count, patch_warning_count, patch_aborted = self._parse_install_log_summary(raw_install_log)
-                if install_log_text:
+                if install_log_text and not live_output.strip():
                     lines.extend(["", "HoloPatcher log:", install_log_text])
             else:
                 patch_error_count = 0
@@ -1044,13 +1101,13 @@ class Kotor2PatcherTab(QWidget):
                 lines.append("STOPPED")
             elif patch_aborted or patch_error_count > 0:
                 lines.append("FAILED: install log reported errors")
-            elif process.returncode == 0:
+            elif returncode == 0:
                 status = "SUCCESS"
                 if patch_warning_count > 0:
                     status += f" ({patch_warning_count} warning(s))"
                 lines.append(status)
             else:
-                lines.append(f"FAILED: exit {process.returncode}")
+                lines.append(f"FAILED: exit {returncode}")
             return "\n".join(lines)
         except Exception as exc:
             lines.extend(["", f"ERROR: {exc}"])
@@ -1310,7 +1367,7 @@ class Kotor2PatcherTab(QWidget):
                 label = f"{entry.mod_name} / {entry.patch_name}"
                 lines.append(f"[{index}/{len(enabled_entries)}] {label}")
                 self._set_runner_activity(f"Running {index}/{len(enabled_entries)}")
-                self._set_status_text(f"{self._runner_log_text.rstrip()}\n[{index}/{len(enabled_entries)}] {label}")
+                self._append_status_text(f"[{index}/{len(enabled_entries)}] {label}")
 
                 temp_mod, error = self._stage_patch_for_run(entry, temp_root)
                 if temp_mod is None:
@@ -1327,21 +1384,15 @@ class Kotor2PatcherTab(QWidget):
                     str(patcher_dir),
                     "--tslpatchdata",
                     str(temp_patch),
+                    "--yes",
+                    "--non-interactive",
                 ]
                 try:
-                    process = subprocess.Popen(
+                    self._append_live_status_text("\n\nHoloPatcher live log:\n")
+                    returncode, live_output = self._run_holopatcher_process(
                         cmd,
+                        self._append_live_status_text,
                     )
-                    self._current_patcher_process = process
-                    while process.poll() is None:
-                        QApplication.processEvents()
-                        if self._stop_patcher_requested:
-                            try:
-                                process.terminate()
-                            except Exception:
-                                pass
-                            break
-                        time.sleep(0.05)
                     install_log = temp_mod / "installlog.txt"
                     install_log_text = ""
                     patch_aborted = False
@@ -1361,31 +1412,25 @@ class Kotor2PatcherTab(QWidget):
                             error_mods.append(label)
                         if patch_aborted and label not in error_mods:
                             error_mods.append(label)
+                    if install_log_text and not live_output.strip():
+                        self._append_live_status_text(f"\nHoloPatcher log:\n{install_log_text}\n")
                     if self._stop_patcher_requested:
                         lines.append("  STOPPED")
                         failures += 1
-                        block = f"[{index}/{len(enabled_entries)}] {label}"
-                        if install_log_text:
-                            block += f"\n\nHoloPatcher log:\n{install_log_text}"
-                        block += "\n\n  STOPPED"
-                        self._append_status_text(block)
+                        self._append_status_text("  STOPPED")
                         break
                     if patch_aborted or patch_error_count > 0:
                         lines.append("  FAILED: install log reported errors")
                         failures += 1
                         status_line = "  FAILED: install log reported errors"
-                    elif process.returncode == 0:
+                    elif returncode == 0:
                         lines.append("  SUCCESS")
                         status_line = "  SUCCESS"
                     else:
-                        lines.append(f"  FAILED: exit {process.returncode}")
+                        lines.append(f"  FAILED: exit {returncode}")
                         failures += 1
-                        status_line = f"  FAILED: exit {process.returncode}"
-                    block = f"[{index}/{len(enabled_entries)}] {label}"
-                    if install_log_text:
-                        block += f"\n\nHoloPatcher log:\n{install_log_text}"
-                    block += f"\n\n{status_line}"
-                    self._append_status_text(block)
+                        status_line = f"  FAILED: exit {returncode}"
+                    self._append_status_text(status_line)
                 except Exception as exc:
                     lines.append(f"  ERROR: {exc}")
                     failures += 1
