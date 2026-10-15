@@ -45,6 +45,7 @@ from .metadata import (
     write_download_meta_field,
     write_mod_meta_for_build_match,
 )
+from mega_download import completed_mega_download, is_mega_url
 from .models import InstalledModEntry as _InstalledModEntry
 from .models import ValidationResult as _ValidationResult
 from .nexus import (
@@ -650,6 +651,9 @@ class KotorBuilderWindow(QWidget):
         if "deadlystream.com" in host:
             if self._start_builder_deadlystream_download(entry, url):
                 return
+        if is_mega_url(url):
+            if self._start_builder_mega_download(entry, url):
+                return
         self._start_builder_browser_download(entry, url, "Browser fallback", self._basic_download_meta_fields(entry))
 
 
@@ -697,6 +701,64 @@ class KotorBuilderWindow(QWidget):
                 metadata = self._deadlystream_meta_fields_from_stdout(entry, stdout)
                 self._start_builder_browser_download(entry, url, "DeadlyScraper fallback", metadata)
                 return
+        QTimer.singleShot(0, self._process_next_build_download)
+
+
+    def _start_builder_mega_download(self, entry: _BuildModEntry, url: str) -> bool:
+        downloader = self._mega_downloader_exe()
+        if not downloader.exists():
+            self._details.appendPlainText(f"MegaDownloader.exe not found: {downloader}")
+            return False
+        downloads_path = Path(self._organizer.downloadsPath())
+        self._download_existing_names = {
+            path.name for path in downloads_path.iterdir() if path.is_file()
+        }
+        self._details.appendPlainText(f"Starting MEGA download to {downloads_path}")
+        process = QProcess(self)
+        self._download_process = process
+        process.finished.connect(
+            lambda code, _status, entry=entry, process=process:
+            self._finish_builder_mega_download(entry, process, code)
+        )
+        process.start(str(downloader), [url, str(downloads_path)])
+        return True
+
+
+    def _finish_builder_mega_download(self, entry: _BuildModEntry, process: QProcess, exit_code: int):
+        stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+        stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._download_process = None
+        downloads_path = Path(self._organizer.downloadsPath())
+        archive_path = completed_mega_download(stdout, downloads_path)
+        if archive_path is None:
+            downloaded_names = self._new_builder_download_names()
+            if len(downloaded_names) == 1:
+                archive_path = downloads_path / downloaded_names[0]
+        if exit_code == 0 and archive_path is not None:
+            metadata = self._basic_download_meta_fields(entry)
+            metadata["name"] = archive_path.stem
+            write_download_meta(downloads_path, archive_path.name, metadata)
+            self._download_meta_entries_cache = None
+            self._summary_label.setText(f"downloaded {entry.name}")
+            self._details.appendPlainText(f"Finished MEGA download: {entry.name} -> {archive_path.name}")
+            QTimer.singleShot(0, self._process_next_build_download)
+            return
+
+        if stdout:
+            self._details.appendPlainText(stdout)
+        if stderr:
+            self._details.appendPlainText(stderr)
+        url = str(entry.urls[0]).strip() if entry.urls else ""
+        self._summary_label.setText(f"download failed: {entry.name}")
+        self._details.appendPlainText(f"MegaDownloader failed for: {entry.name}")
+        if url:
+            self._start_builder_browser_download(
+                entry,
+                url,
+                "MegaDownloader fallback",
+                self._basic_download_meta_fields(entry),
+            )
+            return
         QTimer.singleShot(0, self._process_next_build_download)
 
     def _write_builder_deadlystream_meta(self, entry: _BuildModEntry, downloaded_names: list[str], stdout: str):
@@ -778,6 +840,8 @@ class KotorBuilderWindow(QWidget):
             repository = "Nexus"
         elif "deadlystream.com" in host:
             repository = "DeadlyStream"
+        elif is_mega_url(url):
+            repository = "MEGA"
         return {
             "installed": "false",
             "uninstalled": "false",
@@ -1464,6 +1528,11 @@ class KotorBuilderWindow(QWidget):
     @staticmethod
     def _deadly_scraper_exe() -> Path:
         return Path(__file__).resolve().parent.parent / "DeadlyScraper.exe"
+
+
+    @staticmethod
+    def _mega_downloader_exe() -> Path:
+        return Path(__file__).resolve().parent.parent / "MegaDownloader.exe"
 
 
     def _stop_validation(self):
