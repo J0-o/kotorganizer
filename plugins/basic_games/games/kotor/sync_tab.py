@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 
 from archive_service import ArchiveService
 from hash_utils import file_hash
+from mega_download import completed_mega_download, is_mega_url
 from sync_installer import SyncInstallResult
 from sync_workers import (
     _DownloadedValidationWorker,
@@ -381,6 +382,8 @@ class Kotor2SyncTab(QWidget):
             return
         if "nexusmods.com" in host and self._start_nexus_download(row, mod, url):
             return
+        if is_mega_url(url) and self._start_mega_download(row, mod, url):
+            return
         self._defer_manual_download(row, mod, url, "Browser fallback")
 
 
@@ -457,6 +460,61 @@ class Kotor2SyncTab(QWidget):
             str(mod.get("url") or ""),
             "DeadlyScraper fallback",
         )
+
+
+    def _start_mega_download(self, row: QTreeWidgetItem, mod: dict, url: str) -> bool:
+        downloader = Path(__file__).resolve().parent / "MegaDownloader.exe"
+        if not downloader.exists():
+            self._append_download_detail("MegaDownloader.exe is missing; using browser fallback.", warning=True)
+            return False
+        process = QProcess(self)
+        self._download_process = process
+        self._download_process_context = (
+            row,
+            mod,
+            {path.name for path in self._downloads_path().iterdir() if path.is_file()},
+        )
+        self._stop_download_btn.setEnabled(True)
+        process.finished.connect(
+            lambda code, _status, row=row, mod=mod, process=process:
+            self._finish_mega_download(row, mod, process, code)
+        )
+        self._append_download_detail(f"Starting MEGA download to {self._downloads_path()}")
+        process.start(str(downloader), [url, str(self._downloads_path())])
+        return True
+
+
+    def _finish_mega_download(self, row: QTreeWidgetItem, mod: dict, process: QProcess, exit_code: int):
+        stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+        stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._download_process = None
+        context = self._download_process_context
+        self._download_process_context = None
+        if self._download_cancel_requested:
+            self._download_cancel_requested = False
+            if context is not None:
+                cancel_row, cancel_mod, existing_names = context
+                self._cleanup_download_artifacts(existing_names)
+                self._mark_download_stopped(cancel_row, cancel_mod, "MEGA download stopped and cleaned up.")
+            self._download_btn.setEnabled(self._download_missing_available)
+            self._stop_download_btn.setEnabled(False)
+            return
+
+        existing_names = context[2] if context is not None else set()
+        downloaded_path = completed_mega_download(stdout, self._downloads_path())
+        if downloaded_path is None:
+            downloaded_path = self._detect_new_download(existing_names)
+        if exit_code == 0 and downloaded_path is not None:
+            self._mark_downloaded(row, mod, downloaded_path, "Downloaded with MegaDownloader.", continue_queue=True)
+            return
+
+        details = ["MegaDownloader failed; using browser fallback."]
+        if stdout:
+            details.append(stdout)
+        if stderr:
+            details.append(stderr)
+        self._append_download_detail("\n".join(details), warning=True)
+        self._defer_manual_download(row, mod, str(mod.get("url") or ""), "MegaDownloader fallback")
 
 
     def _start_nexus_download(self, row: QTreeWidgetItem, mod: dict, url: str) -> bool:
@@ -1957,6 +2015,8 @@ class Kotor2SyncTab(QWidget):
                 repository = "Nexus"
             elif "deadlystream.com" in host:
                 repository = "DeadlyStream"
+            elif is_mega_url(url):
+                repository = "MEGA"
 
         fields = {
             "installed": "false",
