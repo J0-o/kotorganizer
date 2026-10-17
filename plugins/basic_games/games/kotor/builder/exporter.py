@@ -1,24 +1,16 @@
 import base64
 import difflib
 import json
-import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
+from archive_service import ArchiveService
 from hash_utils import file_hash as _file_hash
 from hash_utils import file_hashes as _file_hashes
 
 
 TEXT_EXTENSIONS = {".ini", ".cfg", ".txt"}
-SUBPROCESS_STARTUPINFO = None
-SUBPROCESS_CREATIONFLAGS = 0
-if os.name == "nt":
-    SUBPROCESS_STARTUPINFO = subprocess.STARTUPINFO()
-    SUBPROCESS_STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    SUBPROCESS_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW
 
 
 
@@ -84,7 +76,7 @@ def build_instruction_set(
 
     total = len(ordered_mods)
     if progress and ordered_mods:
-        progress(0, total, "7-Zip", "Using bundled kotor/7z.exe")
+        progress(0, total, "Archive reader", "Using MO2's archive service")
 
     for index, mod in enumerate(ordered_mods, start=1):
         if progress:
@@ -240,49 +232,17 @@ def _archive_files(path: Path, warnings: list[str], progress=None, current: int 
     if not path.exists():
         warnings.append(f"Archive not found: {path}")
         return []
-    return _seven_zip_files(path, warnings, progress, current, total, mod_name)
-
-
-
-def _seven_zip_files(path: Path, warnings: list[str], progress=None, current: int = 0, total: int = 0, mod_name: str = "") -> list[dict]:
-    exe = _seven_zip_exe()
-    if not exe:
-        warnings.append(
-            f"Bundled 7-Zip is missing. Expected kotor/7z.exe and kotor/7z.dll; cannot inspect archive: {path.name}"
-        )
-        return []
 
     with tempfile.TemporaryDirectory(prefix="kotorganizer_archive_") as temp_dir:
         temp_path = Path(temp_dir)
         if progress:
-            progress(current, total, mod_name, f"Extracting archive once with 7-Zip: {path.name}")
-        result = subprocess.run(
-            [exe, "x", "-y", f"-o{temp_path}", str(path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            startupinfo=SUBPROCESS_STARTUPINFO,
-            creationflags=SUBPROCESS_CREATIONFLAGS,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            warnings.append(f"Bundled 7-Zip failed to extract {path.name}: {detail}")
+            progress(current, total, mod_name, f"Extracting archive: {path.name}")
+        extraction_error = ArchiveService.extract_archive(path, temp_path)
+        if extraction_error:
+            warnings.append(f"Archive extraction failed for {path.name}: {extraction_error}")
             return []
 
         return _folder_files(temp_path, temp_path, progress, current, total, mod_name, "Hashing extracted archive files")
-
-
-
-@lru_cache(maxsize=1)
-def _seven_zip_exe() -> str:
-    plugin_dir = Path(__file__).resolve().parent.parent
-    exe = plugin_dir / "7z.exe"
-    dll = plugin_dir / "7z.dll"
-    if exe.exists() and dll.exists():
-        return str(exe)
-    return ""
 
 
 
