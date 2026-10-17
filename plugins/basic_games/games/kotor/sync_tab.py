@@ -604,9 +604,19 @@ class Kotor2SyncTab(QWidget):
         self._nexus_auto_download_available = False
         self._nexus_download_id = None
         self._browser_waiting = None
+        QTimer.singleShot(0, self._refresh_download_manager_view)
         popup_url = self._nexus_download_popup_url(mod, url)
         self._append_download_detail("MO2 Nexus download failed; using browser fallback.", warning=True)
         self._defer_manual_download(row, mod, popup_url or url, "Nexus DownloadPopUp fallback")
+
+
+    def _refresh_download_manager_view(self):
+        try:
+            download_manager = self._organizer.downloadManager()._object()
+            download_manager.aboutToResetModel.emit()
+            download_manager.modelReset.emit()
+        except Exception as exc:
+            _log_warning(f"Could not refresh MO2 downloads after Nexus failure: {exc}")
 
 
     @staticmethod
