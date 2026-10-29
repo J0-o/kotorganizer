@@ -583,25 +583,11 @@ class ArchiveService:
     @classmethod
     def extract_archive(cls, archive_path: Path, output_path: Path) -> str:
         dll_path = cls.seven_zip_dll()
-        if dll_path is not None:
-            try:
-                with ArchiveReader(archive_path, dll_path=dll_path) as archive:
-                    archive.extract_all(output_path)
-                return ""
-            except Exception as exc:
-                return str(exc)
-
-        if archive_path.suffix.lower() != ".zip":
+        if dll_path is None:
             return "MO2's dlls\\7zip.dll was not found"
         try:
-            output_path.mkdir(parents=True, exist_ok=True)
-            output_root = output_path.resolve()
-            with zipfile.ZipFile(archive_path) as archive:
-                for member in archive.infolist():
-                    destination = (output_root / member.filename).resolve()
-                    if destination != output_root and output_root not in destination.parents:
-                        raise ValueError(f"Archive entry escapes the output directory: {member.filename}")
-                archive.extractall(output_path)
+            with ArchiveReader(archive_path, dll_path=dll_path) as archive:
+                archive.extract_all(output_path)
             return ""
         except Exception as exc:
             return str(exc)

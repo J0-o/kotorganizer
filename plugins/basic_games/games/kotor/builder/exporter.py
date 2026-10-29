@@ -40,6 +40,10 @@ class BuildResult:
     warnings: list[str]
 
 
+class ArchiveExtractionError(RuntimeError):
+    pass
+
+
 @dataclass
 class InitialBuildMod:
     priority: int
@@ -83,6 +87,8 @@ def build_instruction_set(
             progress(index, total, mod.mod_name, "Reading archive and installed files")
         try:
             payload["mods"].append(_build_mod_payload(mod, warnings, progress, index, total))
+        except ArchiveExtractionError:
+            raise
         except Exception as exc:
             skipped.append(f"{mod.mod_name}: {exc}")
 
@@ -239,8 +245,7 @@ def _archive_files(path: Path, warnings: list[str], progress=None, current: int 
             progress(current, total, mod_name, f"Extracting archive: {path.name}")
         extraction_error = ArchiveService.extract_archive(path, temp_path)
         if extraction_error:
-            warnings.append(f"Archive extraction failed for {path.name}: {extraction_error}")
-            return []
+            raise ArchiveExtractionError(f"archive extraction failed for {path.name}: {extraction_error}")
 
         return _folder_files(temp_path, temp_path, progress, current, total, mod_name, "Hashing extracted archive files")
 
